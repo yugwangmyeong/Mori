@@ -1,0 +1,68 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// User model for authentication and user management
+model User {
+  id        String   @id @default(uuid())
+  email     String?  @unique
+  name      String?
+  provider  String   @default("kakao") // kakao, google, etc.
+  kakaoId   String?  @unique // 카카오 사용자 ID
+  profileImageUrl String?
+  accessToken String? @db.Text // OAuth access token (암호화 권장)
+  refreshToken String? @db.Text // OAuth refresh token (암호화 권장)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  chatMessages ChatMessage[]
+  voiceSessions VoiceSession[]
+  
+  @@index([kakaoId])
+  @@index([provider])
+  @@map("users")
+}
+
+// Chat message model
+model ChatMessage {
+  id        String   @id @default(uuid())
+  userId    String
+  message   String   @db.Text
+  response  String?  @db.Text
+  createdAt DateTime @default(now())
+  
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([createdAt])
+  @@map("chat_messages")
+}
+
+// Voice session model for WebRTC sessions
+model VoiceSession {
+  id        String   @id @default(uuid())
+  userId    String
+  sessionId String   @unique
+  status    String   @default("active") // active, ended, failed
+  createdAt DateTime @default(now())
+  endedAt   DateTime?
+  
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([sessionId])
+  @@index([status])
+  @@map("voice_sessions")
+}
+
