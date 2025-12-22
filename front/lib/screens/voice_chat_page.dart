@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lottie/lottie.dart';
 import '../providers/service_providers.dart';
-import '../services/realtime_service.dart';
 import '../models/ui_phase.dart';
 import '../widgets/waveform_ring.dart';
 
@@ -18,8 +17,7 @@ class _VoiceChatPageState extends ConsumerState<VoiceChatPage>
     with SingleTickerProviderStateMixin {
   StreamSubscription? _uiPhaseSubscription;
   StreamSubscription? _connectionSubscription;
-  StreamSubscription? _userTranscriptSubscription;
-  StreamSubscription? _messageSubscription;
+  StreamSubscription? _transcriptSubscription;
   
   UiPhase _currentPhase = UiPhase.idle;
   String _userTranscript = '';
@@ -35,10 +33,10 @@ class _VoiceChatPageState extends ConsumerState<VoiceChatPage>
   }
 
   Future<void> _initializeConnection() async {
-    final realtimeService = ref.read(realtimeServiceProvider);
+    final webrtcService = ref.read(webrtcVoiceServiceProvider);
     
     // UI 상태 리스너
-    _uiPhaseSubscription = realtimeService.uiPhase.listen((phase) {
+    _uiPhaseSubscription = webrtcService.uiPhase.listen((phase) {
       if (mounted) {
         setState(() {
           _currentPhase = phase;
@@ -47,14 +45,14 @@ class _VoiceChatPageState extends ConsumerState<VoiceChatPage>
     });
 
     // 연결 상태 리스너
-    _connectionSubscription = realtimeService.connectionStatus.listen((status) {
+    _connectionSubscription = webrtcService.connectionStatus.listen((status) {
       if (mounted) {
         setState(() {});
       }
     });
 
     // 사용자 음성 전사 리스너 (개발자 모드용)
-    _userTranscriptSubscription = realtimeService.userTranscript.listen((transcript) {
+    _transcriptSubscription = webrtcService.transcript.listen((transcript) {
       if (mounted && _showTranscript) {
         setState(() {
           _userTranscript = transcript;
@@ -62,22 +60,8 @@ class _VoiceChatPageState extends ConsumerState<VoiceChatPage>
       }
     });
 
-    // 메시지 이벤트 리스너 (transcription.completed만 사용)
-    _messageSubscription = realtimeService.messages.listen((message) {
-      final type = message['type'] as String?;
-      if (type == 'conversation.item.input_audio_transcription.completed' && _showTranscript) {
-        final transcript = message['item']?['input_audio_transcription']?['transcript'] ?? 
-                          message['transcript'] ?? '';
-        if (mounted && transcript.isNotEmpty) {
-          setState(() {
-            _userTranscript = transcript;
-          });
-        }
-      }
-    });
-
     // 연결 시도
-    await realtimeService.connect();
+    await webrtcService.connect();
   }
 
   @override
@@ -85,16 +69,15 @@ class _VoiceChatPageState extends ConsumerState<VoiceChatPage>
     _lottieController.dispose();
     _uiPhaseSubscription?.cancel();
     _connectionSubscription?.cancel();
-    _userTranscriptSubscription?.cancel();
-    _messageSubscription?.cancel();
+    _transcriptSubscription?.cancel();
     super.dispose();
   }
 
 
   @override
   Widget build(BuildContext context) {
-    final realtimeService = ref.watch(realtimeServiceProvider);
-    final isConnected = realtimeService.isConnected;
+    final webrtcService = ref.watch(webrtcVoiceServiceProvider);
+    final isConnected = webrtcService.isConnected;
 
     return Scaffold(
       backgroundColor: Colors.grey[50],

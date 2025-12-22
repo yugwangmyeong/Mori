@@ -208,17 +208,93 @@ extension RealtimeAudioManager on RealtimeService {
     }
   }
 
-  // 마이크 토글은 더 이상 사용하지 않음 (대화 일시정지로 대체)
-  Future<void> toggleMute() async {
-    print('⚠️ toggleMute()는 deprecated입니다. setPaused(true/false) 사용');
+  // 마이크 OFF: replaceTrack(null)로 송신 완전 중단
+  Future<void> turnMicrophoneOff() async {
+    try {
+      if (_peerConnection == null) {
+        print('⚠️ PeerConnection이 없습니다.');
+        return;
+      }
+
+      if (_audioSender == null) {
+        print('⚠️ 오디오 sender가 없습니다.');
+        return;
+      }
+
+      // sender에 null 트랙 설정하여 송신 중단
+      await _audioSender!.replaceTrack(null);
+      print('🛑 마이크 OFF: replaceTrack(null) 적용 완료');
+      
+      // 로컬 트랙 정리
+      if (_localStream != null) {
+        final audioTracks = _localStream!.getAudioTracks();
+        for (var track in audioTracks) {
+          await track.stop();
+        }
+        await _localStream!.dispose();
+        _localStream = null;
+        print('   → 로컬 트랙 정리 완료');
+      }
+      
+      _logMic('MIC OFF: sender track=${_audioSender?.track?.id}');
+    } catch (e) {
+      print('❌ 마이크 OFF 오류: $e');
+    }
   }
 
-  Future<void> mute() async {
-    print('⚠️ mute()는 deprecated입니다. 마이크는 항상 on, setPaused(true) 사용');
+  // 마이크 ON: 새 트랙 생성 후 replaceTrack(newTrack)로 복구
+  Future<void> turnMicrophoneOn() async {
+    try {
+      if (_peerConnection == null) {
+        print('⚠️ PeerConnection이 없습니다.');
+        return;
+      }
+
+      if (_audioSender == null) {
+        print('⚠️ 오디오 sender가 없습니다. 연결 후 다시 시도하세요.');
+        return;
+      }
+
+      // 새 오디오 트랙 생성
+      final Map<String, dynamic> mediaConstraints = {
+        'audio': {
+          'sampleRate': 24000,
+          'channelCount': 1,
+          'echoCancellation': true,
+          'noiseSuppression': true,
+        },
+      };
+      
+      _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+      final audioTracks = _localStream!.getAudioTracks();
+      
+      if (audioTracks.isEmpty) {
+        print('❌ 오디오 트랙을 생성할 수 없습니다.');
+        return;
+      }
+
+      final newTrack = audioTracks.first;
+      
+      // sender에 새 트랙 설정하여 송신 재개
+      await _audioSender!.replaceTrack(newTrack);
+      print('🎤 마이크 ON: replaceTrack(newTrack) 적용 완료');
+      print('   → 새 트랙 ID: ${newTrack.id}');
+      
+      _logMic('MIC ON: sender track=${_audioSender?.track?.id}');
+    } catch (e) {
+      print('❌ 마이크 ON 오류: $e');
+    }
   }
 
-  Future<void> unmute() async {
-    print('⚠️ unmute()는 deprecated입니다. 마이크는 항상 on, setPaused(false) 사용');
+  // 마이크 토글 (OFF ↔ ON)
+  Future<void> toggleMicrophone() async {
+    if (_localStream == null || _localStream!.getAudioTracks().isEmpty) {
+      // 마이크가 꺼져있으면 켜기
+      await turnMicrophoneOn();
+    } else {
+      // 마이크가 켜져있으면 끄기
+      await turnMicrophoneOff();
+    }
   }
 
   // 오디오 스트림 중지

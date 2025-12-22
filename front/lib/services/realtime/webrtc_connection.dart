@@ -157,10 +157,11 @@ extension RealtimeWebRTCConnection on RealtimeService {
       final audioTracks = _localStream!.getAudioTracks();
       
       if (audioTracks.isNotEmpty) {
-        for (var track in audioTracks) {
-          await _peerConnection!.addTrack(track, _localStream!);
-          print('✅ 마이크 오디오 트랙을 PeerConnection에 추가 (연결 전): ${track.id}');
-        }
+        // 첫 번째 오디오 트랙만 추가하고 sender 저장 (중복 방지)
+        final track = audioTracks.first;
+        _audioSender = await _peerConnection!.addTrack(track, _localStream!);
+        print('✅ 마이크 오디오 트랙을 PeerConnection에 추가 (연결 전): ${track.id}');
+        print('   → RTCRtpSender 저장: ${_audioSender?.track?.id}');
         await _logLocalAudioSender();
       } else {
         print('⚠️ 마이크 오디오 트랙을 찾을 수 없습니다.');

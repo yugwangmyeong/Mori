@@ -41,7 +41,7 @@ class AuthService {
       return 'localhost';
     }
     
-    // IP:포트 형식이면 IP만 추출 (예: 172.20.10.5:3000 -> 172.20.10.5)
+    // IP:포트 형식이면 IP만 추출 (예: 172.30.1.29:8000 -> 172.30.1.29)
     if (envUrl.contains(':')) {
       final ipOnly = envUrl.split(':').first;
       print('🔧 [DEBUG] IP:포트 형식에서 IP만 추출: $ipOnly');
@@ -58,14 +58,9 @@ class AuthService {
     if (kDebugMode) {
       final serverIp = _getServerBaseUrl();
       
-      // 개발 모드: 플랫폼별 자동 감지
-      if (Platform.isAndroid) {
-        // Android: 에뮬레이터는 10.0.2.2, 실제 기기는 서버 IP 필요
-        return 'http://$serverIp:3000/api/auth';
-      } else if (Platform.isIOS) {
-        // iOS: 시뮬레이터는 localhost, 실제 기기는 서버 IP 필요
-        return 'http://$serverIp:3000/api/auth';
-      }
+      // 개발 모드: FastAPI 서버 사용 (포트 8000)
+      // Express.js (포트 3000)에서 FastAPI (포트 8000)로 전환
+      return 'http://$serverIp:8000/api/auth';
     }
     // 프로덕션 모드: 실제 서버 URL
     return 'https://your-production-server.com/api/auth'; //나중에 배포할때 사용
@@ -83,8 +78,11 @@ class AuthService {
       print('   Health Check URL: $healthUrl');
       print('   Backend IP from .env: ${_getServerBaseUrl()}');
       print('   Platform: ${Platform.operatingSystem}');
+      print('   Timestamp: ${DateTime.now().toIso8601String()}');
       print('═══════════════════════════════════════════════════════');
       
+      print('📡 Health check 요청 전송 중...');
+      final stopwatch = Stopwatch()..start();
       final response = await http.get(
         Uri.parse(healthUrl),
         headers: {
@@ -94,18 +92,23 @@ class AuthService {
       ).timeout(
         const Duration(seconds: 15),
         onTimeout: () {
+          stopwatch.stop();
           print('⏱️ Connection timeout after 15 seconds');
           print('   This usually means the server is not reachable');
+          print('   Elapsed time: ${stopwatch.elapsedMilliseconds}ms');
           throw Exception('Connection timeout: 서버가 응답하지 않습니다.');
         },
       );
       
+      stopwatch.stop();
       print('📡 Backend health check response received!');
       print('   Status Code: ${response.statusCode}');
       print('   Response Body: ${response.body}');
+      print('   Response Time: ${stopwatch.elapsedMilliseconds}ms');
       
       if (response.statusCode == 200) {
         print('✅ Backend server is connected and running!');
+        print('   Server: FastAPI (포트 8000)');
         print('═══════════════════════════════════════════════════════');
         return true;
       } else {
@@ -122,13 +125,14 @@ class AuthService {
       print('   Port: ${e.port}');
       print('═══════════════════════════════════════════════════════');
       print('💡 Troubleshooting:');
-      print('   1. 백엔드 서버가 실행 중인지 확인: cd backend && npm run dev');
-      print('   2. 서버 IP 주소 확인: ${_getServerBaseUrl()}:3000');
+      print('   1. FastAPI 서버가 실행 중인지 확인: cd backend_python && python main.py');
+      print('   2. 서버 IP 주소 확인: ${_getServerBaseUrl()}:8000');
       print('   3. 같은 Wi-Fi 네트워크에 연결되어 있는지 확인');
-      print('   4. 방화벽이 포트 3000을 차단하지 않는지 확인');
-      print('   5. Windows 방화벽: 포트 3000 인바운드 규칙 추가 필요');
-      print('   6. 브라우저에서 http://${_getServerBaseUrl()}:3000/health 접속 테스트');
+      print('   4. 방화벽이 포트 8000을 차단하지 않는지 확인');
+      print('   5. Windows 방화벽: 포트 8000 인바운드 규칙 추가 필요');
+      print('   6. 브라우저에서 http://${_getServerBaseUrl()}:8000/health 접속 테스트');
       print('   7. AndroidManifest.xml에 usesCleartextTraffic="true" 추가 확인');
+      print('   8. 서버가 0.0.0.0으로 바인딩되어 있는지 확인 (host=0.0.0.0)');
       print('═══════════════════════════════════════════════════════');
       return false;
     } on HttpException catch (e) {
@@ -152,12 +156,13 @@ class AuthService {
       }
       print('═══════════════════════════════════════════════════════');
       print('💡 Troubleshooting:');
-      print('   1. 백엔드 서버가 실행 중인지 확인: cd backend && npm run dev');
-      print('   2. 서버 IP 주소 확인: ${_getServerBaseUrl()}:3000');
+      print('   1. FastAPI 서버가 실행 중인지 확인: cd backend_python && python main.py');
+      print('   2. 서버 IP 주소 확인: ${_getServerBaseUrl()}:8000');
       print('   3. 같은 Wi-Fi 네트워크에 연결되어 있는지 확인');
-      print('   4. 방화벽이 포트 3000을 차단하지 않는지 확인');
-      print('   5. Windows 방화벽: 포트 3000 인바운드 규칙 추가 필요');
-      print('   6. 브라우저에서 http://${_getServerBaseUrl()}:3000/health 접속 테스트');
+      print('   4. 방화벽이 포트 8000을 차단하지 않는지 확인');
+      print('   5. Windows 방화벽: 포트 8000 인바운드 규칙 추가 필요');
+      print('   6. 브라우저에서 http://${_getServerBaseUrl()}:8000/health 접속 테스트');
+      print('   7. 서버가 0.0.0.0으로 바인딩되어 있는지 확인 (host=0.0.0.0)');
       print('   7. AndroidManifest.xml에 usesCleartextTraffic="true" 추가 확인');
       print('═══════════════════════════════════════════════════════');
       return false;

@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lottie/lottie.dart';
-import '../providers/chat_provider.dart';
 import '../providers/auth_provider.dart';
 import '../models/ui_phase.dart';
 import '../theme/app_colors.dart';
 import '../widgets/waveform_ring.dart';
 import '../providers/service_providers.dart';
+import '../services/webrtc_voice_service.dart';
 import 'login_page.dart';
+import 'webrtc_test_page.dart';
 
 class MainPage extends ConsumerStatefulWidget {
   const MainPage({super.key});
@@ -23,6 +24,7 @@ class _MainPageState extends ConsumerState<MainPage>
   UiPhase _currentPhase = UiPhase.idle;
   String _userTranscript = '';
   bool _showTranscript = false;
+  bool _isMicEnabled = true;
 
   @override
   void initState() {
@@ -32,15 +34,13 @@ class _MainPageState extends ConsumerState<MainPage>
       duration: const Duration(milliseconds: 1200),
     )..repeat(reverse: true);
 
-    // MainPage initState connect - 1회만 실행
-    print('MainPage initState connect');
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final chatNotifier = ref.read(chatProvider.notifier);
-      chatNotifier.ensureConnection();
+    // MainPage initState - WebRTC 연결
+    print('MainPage initState - WebRTC 연결 시작');
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final webrtcService = ref.read(webrtcVoiceServiceProvider);
       
       // UI 상태 리스너 설정
-      final realtimeService = ref.read(realtimeServiceProvider);
-      realtimeService.uiPhase.listen((phase) {
+      webrtcService.uiPhase.listen((phase) {
         if (mounted) {
           setState(() {
             _currentPhase = phase;
@@ -48,8 +48,16 @@ class _MainPageState extends ConsumerState<MainPage>
         }
       });
       
-      // 사용자 전사 리스너 (개발자 모드용)
-      realtimeService.userTranscript.listen((transcript) {
+      // 연결 상태 리스너
+      webrtcService.connectionStatus.listen((status) {
+        if (mounted) {
+          setState(() {});
+          print('WebRTC 연결 상태: $status');
+        }
+      });
+      
+      // 전사 리스너 (개발자 모드용)
+      webrtcService.transcript.listen((transcript) {
         if (mounted && _showTranscript) {
           setState(() {
             _userTranscript = transcript;
@@ -57,19 +65,25 @@ class _MainPageState extends ConsumerState<MainPage>
         }
       });
       
-      // 메시지 이벤트 리스너 (transcription.completed만 사용)
-      realtimeService.messages.listen((message) {
-        final type = message['type'] as String?;
-        if (type == 'conversation.item.input_audio_transcription.completed' && _showTranscript) {
-          final transcript = message['item']?['input_audio_transcription']?['transcript'] ?? 
-                            message['transcript'] ?? '';
-          if (mounted && transcript.isNotEmpty) {
-            setState(() {
-              _userTranscript = transcript;
-            });
-          }
+      // 초기 마이크 상태 설정
+      _isMicEnabled = webrtcService.isMicEnabled;
+      
+      // 마이크 상태 리스너
+      webrtcService.micEnabled.listen((enabled) {
+        if (mounted) {
+          setState(() {
+            _isMicEnabled = enabled;
+          });
         }
       });
+      
+      // WebRTC 연결 시작
+      try {
+        await webrtcService.connect();
+        print('✅ WebRTC 연결 성공');
+      } catch (e) {
+        print('❌ WebRTC 연결 실패: $e');
+      }
     });
   }
 
@@ -81,8 +95,7 @@ class _MainPageState extends ConsumerState<MainPage>
 
   @override
   Widget build(BuildContext context) {
-    final chatState = ref.watch(chatProvider);
-    final chatNotifier = ref.read(chatProvider.notifier);
+    final webrtcService = ref.watch(webrtcVoiceServiceProvider);
 
     return Scaffold(
       backgroundColor: AppColors.backgroundLight,
@@ -141,7 +154,19 @@ class _MainPageState extends ConsumerState<MainPage>
             },
             tooltip: '설정',
           ),
-          // 종료 버튼
+          // WebRTC 테스트 버튼 (개발용)
+          IconButton(
+            icon: const Icon(Icons.wifi),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (context) => const WebRTCTestPage(),
+                ),
+              );
+            },
+            tooltip: 'WebRTC 테스트',
+          ),
+              // 종료 버튼
           IconButton(
             icon: const Icon(Icons.exit_to_app, size: 20),
             onPressed: () async {
@@ -165,13 +190,13 @@ class _MainPageState extends ConsumerState<MainPage>
               );
 
               if (shouldLogout == true && mounted) {
-                // Realtime 연결 종료 (hangup 호출)
-                final chatNotifier = ref.read(chatProvider.notifier);
+                // WebRTC 연결 종료
+                final webrtcService = ref.read(webrtcVoiceServiceProvider);
                 try {
-                  await chatNotifier.disconnect();
-                  print('✅ Realtime 연결 종료 완료');
+                  await webrtcService.disconnect();
+                  print('✅ WebRTC 연결 종료 완료');
                 } catch (e) {
-                  print('⚠️ Realtime 연결 종료 중 오류: $e');
+                  print('⚠️ WebRTC 연결 종료 중 오류: $e');
                 }
 
                 // 로그아웃 처리
@@ -261,7 +286,7 @@ class _MainPageState extends ConsumerState<MainPage>
               ],
               
               // 연결 상태 안내
-              if (!chatState.isConnected) ...[
+              if (!webrtcService.isConnected) ...[
                 const SizedBox(height: 20),
                 Text(
                   '연결 중...',
@@ -275,7 +300,7 @@ class _MainPageState extends ConsumerState<MainPage>
               const SizedBox(height: 40),
               
               // 마이크 버튼 (일시정지/재개)
-              _buildMicButton(context, chatState, chatNotifier),
+              _buildMicButton(context, webrtcService),
             ],
           ),
         ),
@@ -286,11 +311,13 @@ class _MainPageState extends ConsumerState<MainPage>
 
   Widget _buildMicButton(
     BuildContext context,
-    ChatState chatState,
-    ChatNotifier chatNotifier,
+    WebRTCVoiceService webrtcService,
   ) {
-    final isPaused = chatState.isPaused;
-    print('🎛️ build mic ui: isPaused=${chatState.isPaused}');
+    // 마이크 상태에 따라 색상 결정
+    final micColor = webrtcService.isConnected && _isMicEnabled 
+        ? Colors.red 
+        : Colors.grey.shade400;
+    final micIcon = _isMicEnabled ? Icons.mic : Icons.mic_off;
 
     return SafeArea(
       child: Padding(
@@ -298,51 +325,34 @@ class _MainPageState extends ConsumerState<MainPage>
         child: Center(
           child: Semantics(
             button: true,
-            label: isPaused ? '대화 재개' : '대화 일시정지',
+            label: _isMicEnabled ? '마이크 끄기' : '마이크 켜기',
             child: GestureDetector(
-              onTap: chatNotifier.togglePause,
+              onTap: () async {
+                print('마이크 버튼 클릭 - 현재 상태: ${_isMicEnabled ? "ON" : "OFF"}');
+                if (webrtcService.isConnected) {
+                  await webrtcService.toggleMicrophone();
+                } else {
+                  print('⚠️ WebRTC가 연결되지 않았습니다.');
+                }
+              },
               child: Container(
                 width: 100,
                 height: 100,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: isPaused ? Colors.grey.shade400 : Colors.red,
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.12),
-                        blurRadius: 6,
-                        offset: const Offset(0, 3),
-                      ),
-                    ],
-                ),
-                child: Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    Icon(
-                      isPaused ? Icons.play_arrow : Icons.pause,
-                      color: Colors.white,
-                      size: 42,
+                  color: micColor,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.12),
+                      blurRadius: 6,
+                      offset: const Offset(0, 3),
                     ),
-                    if (isPaused)
-                      Transform.rotate(
-                        angle: -0.6,
-                        child: Container(
-                          width: 60,
-                          height: 6,
-                          decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.9),
-                            borderRadius: BorderRadius.circular(3),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.15),
-                                blurRadius: 3,
-                                offset: const Offset(0, 1),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
                   ],
+                ),
+                child: Icon(
+                  micIcon,
+                  color: Colors.white,
+                  size: 42,
                 ),
               ),
             ),

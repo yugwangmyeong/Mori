@@ -24,6 +24,7 @@ class RealtimeService {
   RTCDataChannel? _dataChannel;
   MediaStream? _localStream;
   MediaStream? _remoteStream; // AI 오디오 스트림
+  RTCRtpSender? _audioSender; // 오디오 sender 저장 (replaceTrack용)
   bool _isConnected = false;
   bool _sessionReady = false;
   CallState _callState = CallState.idle; // Call 상태 머신
