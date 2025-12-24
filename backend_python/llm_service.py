@@ -5,6 +5,7 @@ OpenAI GPT API 스트리밍 사용
 import logging
 import os
 from typing import AsyncIterator
+from typing import Optional, Callable, Awaitable
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ class LLMService:
         Yields:
             토큰 (delta)
         """
+        import asyncio
+        
         # 대화 히스토리에 추가
         self.conversation_history.append({
             "role": "user",
@@ -50,18 +53,24 @@ class LLMService:
             ]
             messages.extend(self.conversation_history[-10:])  # 최근 10개만 사용
             
-            # 스트리밍 요청
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                temperature=0.7,
-                max_tokens=500
+            # 스트리밍 요청 (동기식 client를 async로 실행)
+            loop = asyncio.get_event_loop()
+            stream = await loop.run_in_executor(
+                None,
+                lambda: self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    temperature=0.7,
+                    max_tokens=500
+                )
             )
             
             assistant_response = ""
             
+            # 스트림을 async로 처리
             for chunk in stream:
+                await asyncio.sleep(0)  # 이벤트 루프에 제어권 양보
                 if chunk.choices[0].delta.content:
                     token = chunk.choices[0].delta.content
                     assistant_response += token

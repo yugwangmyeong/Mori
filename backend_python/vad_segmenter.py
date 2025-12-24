@@ -4,7 +4,8 @@ VADSegmenter - 상태 머신 기반 VAD 세그먼터
 목표: append는 끊지 않고 commit만 지연하여 STT 입력이 중간에 잘리지 않게 함
 
 상태: IDLE, SPEECH, HANGOVER
-- clear는 IDLE→SPEECH 최초 진입에서만 1회 호출
+- pre-roll 링버퍼: IDLE 상태에서도 최근 200-300ms 오디오를 보관하여 초반 음절 손실 방지
+- clear는 commit 후에만 호출 (다음 세그먼트 준비)
 - append는 SPEECH와 HANGOVER 동안 모두 계속 호출 (is_speech=False라도)
 - HANGOVER에서 is_speech=True가 다시 들어오면 새 발화로 취급하지 않음 (세그먼트 유지)
 - commit은 hangover_ms 경과 후에도 재발화가 없을 때만 시도
@@ -12,8 +13,9 @@ VADSegmenter - 상태 머신 기반 VAD 세그먼터
 """
 import asyncio
 import logging
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Deque
 from enum import Enum
+from collections import deque
 import time
 
 logger = logging.getLogger(__name__)
@@ -36,15 +38,17 @@ class VADSegmenter:
         on_commit: Optional[Callable[[], Awaitable[None]]] = None,
         on_get_buffered_ms: Optional[Callable[[], int]] = None,  # STT 클라이언트의 buffered_ms 조회
         hangover_ms: int = 500,
-        min_commit_ms: int = 100  # 최소 100ms (STT 클라이언트 기준)
+        min_commit_ms: int = 100,  # 최소 100ms (STT 클라이언트 기준)
+        pre_roll_ms: int = 300  # pre-roll 버퍼 크기 (200-300ms 권장)
     ):
         """
         Args:
-            on_clear: clear 콜백 (IDLE→SPEECH 최초 진입 시 1회만 호출)
+            on_clear: clear 콜백 (commit 후 다음 세그먼트 준비 시 호출)
             on_append: append 콜백 (SPEECH와 HANGOVER 동안 모두 호출, bytes: 960 bytes)
             on_commit: commit 콜백 (appended_ms >= min_commit_ms일 때 호출)
             hangover_ms: hangover 시간 (300~800ms, 기본 500ms)
-            min_commit_ms: 최소 commit 길이 (기본 700ms)
+            min_commit_ms: 최소 commit 길이 (기본 100ms)
+            pre_roll_ms: pre-roll 버퍼 크기 (기본 300ms, 초반 음절 손실 방지)
         """
         self.on_clear = on_clear
         self.on_append = on_append
@@ -54,9 +58,14 @@ class VADSegmenter:
         self.hangover_ms = max(300, min(800, hangover_ms))
         self.min_commit_ms = min_commit_ms
         self.chunk_ms = 20  # 20ms per chunk
+        self.pre_roll_ms = pre_roll_ms
+        self.pre_roll_chunks = max(10, int(pre_roll_ms / self.chunk_ms))  # 최소 10 chunks (200ms)
         
         # 상태 머신
         self.state = VADState.IDLE
+        
+        # Pre-roll 링버퍼 (IDLE 상태에서도 최근 오디오 보관)
+        self._pre_roll_buffer: Deque[bytes] = deque(maxlen=self.pre_roll_chunks)
         
         # 카운터 (세그먼트 단위로 유지)
         self.appended_chunks = 0  # 현재 세그먼트에서 실제로 append한 chunk 수
@@ -69,6 +78,7 @@ class VADSegmenter:
         # 세그먼트 추적
         self._segment_start_time = 0.0  # 세그먼트 시작 시각 (ms)
         self._segment_id = 0  # 세그먼트 ID (로깅용)
+        self._speech_end_logged = False  # Speech end 로그가 이미 찍혔는지 추적
     
     async def process_chunk(self, pcm16_bytes: bytes, is_speech: bool, metadata: Optional[dict] = None):
         """
@@ -83,6 +93,9 @@ class VADSegmenter:
             current_time = time.time() * 1000  # ms
             
             if self.state == VADState.IDLE:
+                # IDLE 상태에서도 pre-roll 링버퍼에 저장 (초반 음절 손실 방지)
+                self._pre_roll_buffer.append(pcm16_bytes)
+                
                 if is_speech:
                     # IDLE → SPEECH 전환 (새 세그먼트 시작)
                     self.state = VADState.SPEECH
@@ -90,42 +103,30 @@ class VADSegmenter:
                     self.last_speech_time = current_time
                     self._segment_start_time = current_time
                     self._segment_id += 1
+                    self._speech_end_logged = False  # 새 세그먼트 시작 시 리셋
                     
-                    # 세그먼트 시작 시 상세 로깅 (디버깅 체크리스트)
-                    if metadata and 'upstream_info' in metadata:
-                        upstream = metadata['upstream_info']
-                        peak = metadata.get('peak', 0)
-                        rms = metadata.get('rms', 0.0)
-                        zero_ratio = metadata.get('zero_ratio', 0.0)
-                        
-                        logger.info(f"🎙️ [Segment {self._segment_id}] Speech start")
-                        logger.info(f"   Upstream: sr={upstream.get('sample_rate')}, "
-                                  f"format={upstream.get('format')}, "
-                                  f"dtype={upstream.get('dtype')}, "
-                                  f"shape={upstream.get('shape')}")
-                        logger.info(f"   Mono: peak={upstream.get('mono_peak')}, "
-                                  f"rms={upstream.get('mono_rms', 0):.4f}, "
-                                  f"range={upstream.get('mono_range')}")
-                        logger.info(f"   24k final: len={len(pcm16_bytes)} bytes, "
-                                  f"peak={peak}, rms={rms:.4f}, zero_ratio={zero_ratio:.2%}")
-                    else:
-                        logger.info(f"🎙️ [Segment {self._segment_id}] Speech start")
+                    # Speech start 로그
+                    logger.info(f"🎙️ Speech start")
                     
-                    # clear는 IDLE→SPEECH 최초 진입에서만 1회 호출
-                    if self.on_clear:
-                        try:
-                            await self.on_clear()
-                        except Exception as e:
-                            logger.error(f"Error in on_clear callback: {e}", exc_info=True)
-                    
-                    # 첫 청크 append
+                    # clear는 commit 후에만 호출하므로 여기서는 호출하지 않음
+                    # 대신 pre-roll 버퍼의 모든 chunks를 먼저 append
                     if self.on_append:
                         try:
+                            # Pre-roll 버퍼의 모든 chunks를 먼저 append
+                            pre_roll_count = len(self._pre_roll_buffer)
+                            for pre_chunk in self._pre_roll_buffer:
+                                await self.on_append(pre_chunk)
+                                self.appended_chunks += 1
+                            
+                            # 현재 chunk append
                             await self.on_append(pcm16_bytes)
                             self.appended_chunks += 1
+                            
+                            # Pre-roll 버퍼 초기화 (이미 사용됨)
+                            self._pre_roll_buffer.clear()
                         except Exception as e:
                             logger.error(f"Error in on_append callback: {e}", exc_info=True)
-                # else: IDLE 상태에서 무음은 무시 (append 안 함)
+                # else: IDLE 상태에서 무음은 pre-roll 버퍼에만 저장 (STT에는 append 안 함)
             
             elif self.state == VADState.SPEECH:
                 if is_speech:
@@ -141,8 +142,11 @@ class VADSegmenter:
                 else:
                     # SPEECH → HANGOVER 전환 (append는 계속)
                     self.state = VADState.HANGOVER
-                    appended_ms = self.appended_chunks * self.chunk_ms
-                    logger.info(f"🛑 [Segment {self._segment_id}] Speech end → Hangover (chunks={self.appended_chunks}, {appended_ms}ms)")
+                    
+                    # Speech end 로그는 한 번만 찍기
+                    if not self._speech_end_logged:
+                        logger.info(f"🛑 Speech end")
+                        self._speech_end_logged = True
                     
                     # Hangover 태스크 시작 (기존 태스크가 있으면 취소)
                     if self._hangover_task:
@@ -177,9 +181,8 @@ class VADSegmenter:
                     
                     self.state = VADState.SPEECH
                     self.last_speech_time = current_time
+                    self._speech_end_logged = False  # Speech 재개 시 리셋 (다음 end를 위해)
                     
-                    appended_ms = self.appended_chunks * self.chunk_ms
-                    logger.info(f"🎙️ [Segment {self._segment_id}] Speech resume (chunks={self.appended_chunks}, {appended_ms}ms)")
                     # clear 호출 금지, appended_chunks 리셋 금지
                 # else: HANGOVER 상태에서 무음은 계속 대기 (append는 이미 위에서 수행)
     
@@ -204,21 +207,25 @@ class VADSegmenter:
                 
                 if stt_buffered_ms >= self.min_commit_ms:
                     # commit 수행
-                    segment_duration = time.time() * 1000 - self._segment_start_time
-                    logger.info(f"✅ [Segment {self._segment_id}] Commit (STT buffered: {stt_buffered_ms}ms, chunks={self.appended_chunks}, duration={segment_duration:.0f}ms)")
-                    
                     if self.on_commit:
                         try:
                             await self.on_commit()
                         except Exception as e:
                             logger.error(f"Error in on_commit callback: {e}", exc_info=True)
-                else:
-                    logger.warning(f"⚠️ [Segment {self._segment_id}] Skip commit (STT buffered: {stt_buffered_ms}ms < {self.min_commit_ms}ms minimum)")
+                    
+                    # commit 후 clear 호출 (다음 세그먼트 준비)
+                    if self.on_clear:
+                        try:
+                            await self.on_clear()
+                        except Exception as e:
+                            logger.error(f"Error in on_clear callback: {e}", exc_info=True)
                 
                 # HANGOVER → IDLE 전환
                 self.state = VADState.IDLE
                 self.appended_chunks = 0
                 self._hangover_task = None
+                self._speech_end_logged = False  # IDLE로 전환 시 리셋
+                # Pre-roll 버퍼는 유지 (다음 세그먼트를 위해)
         
         except asyncio.CancelledError:
             # speech 재진입으로 인한 취소는 정상 동작
@@ -239,4 +246,5 @@ class VADSegmenter:
             
             self.state = VADState.IDLE
             self.appended_chunks = 0
+            self._pre_roll_buffer.clear()
 

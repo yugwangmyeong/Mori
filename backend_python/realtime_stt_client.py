@@ -44,6 +44,8 @@ class RealtimeSttClient:
         self._on_partial: Optional[Callable[[str], Awaitable[None]]] = None
         self._on_final: Optional[Callable[[str], Awaitable[None]]] = None
         self._on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+        self._on_speech_started: Optional[Callable[[], Awaitable[None]]] = None
+        self._on_speech_stopped: Optional[Callable[[], Awaitable[None]]] = None
         
         # 내부 버퍼링 추적 (실제 append 성공 시에만 증가)
         self._buffered_ms = 0  # 현재 버퍼에 쌓인 오디오 길이 (밀리초)
@@ -62,8 +64,6 @@ class RealtimeSttClient:
                 "OpenAI-Beta": "realtime=v1"
             }
             
-            logger.info(f"Connecting to Realtime API for session {self.session_id} (sample_rate={self.sample_rate}Hz)")
-            
             self.ws = await websockets.connect(
                 self.REALTIME_API_URL,
                 additional_headers=headers
@@ -74,8 +74,6 @@ class RealtimeSttClient:
             # 세션 설정 (STT만 활성화)
             await self._configure_session()
             
-            logger.info("✅ Realtime STT WebSocket connected")
-            
         except Exception as e:
             logger.error(f"Failed to connect Realtime STT: {e}", exc_info=True)
             self._connected = False
@@ -83,25 +81,28 @@ class RealtimeSttClient:
     
     async def _configure_session(self):
         """
-        세션 설정 - 로컬 VAD 방식 (turn_detection: None)
+        세션 설정 - server_vad 방식 (Realtime STT가 턴을 판단)
         
         중요:
         - transcription_session.update 이벤트 타입 사용
-        - session.input_audio_* 계열의 평평한 필드 구조 사용
-        - turn_detection은 None (로컬 VAD 사용)
-        - 로컬 VAD가 말 끝을 감지하면 commit/clear 호출
+        - turn_detection에 server_vad 설정
+        - 서버가 speech_started/speech_stopped 이벤트로 턴을 판단
         """
-        # 로컬 VAD 방식: turn_detection=None, 로컬 VAD로 말 끝 감지 후 commit
+        # server_vad 방식: 서버가 턴 판단 (과민 끊김 완화 설정)
         config = {
             "type": "transcription_session.update",
             "session": {
                 "input_audio_format": "pcm16",  # 16-bit little-endian PCM (24kHz)
                 "input_audio_transcription": {
                     "model": "gpt-4o-transcribe",
-                    "language": "ko",
-                    "prompt": ""
+                    "language": "ko"
                 },
-                "turn_detection": None,  # 로컬 VAD 사용 (서버 VAD 사용 안 함)
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.6,  # 덜 민감 (과민 끊김 완화)
+                    "prefix_padding_ms": 500,
+                    "silence_duration_ms": 800  # 끊김 완화 핵심
+                },
                 "input_audio_noise_reduction": {
                     "type": "near_field"
                 },
@@ -109,10 +110,7 @@ class RealtimeSttClient:
             }
         }
         
-        logger.info(f"📤 Sending transcription_session.update (Local VAD mode, turn_detection=None)")
-        logger.debug(f"   Config: {json.dumps(config, indent=2)[:500]}")
         await self.send_event(config)
-        logger.info("✅ Transcription session update sent (waiting for transcription_session.updated event)")
     
     async def close(self):
         """WebSocket 연결 종료"""
@@ -132,7 +130,6 @@ class RealtimeSttClient:
             self.ws = None
         
         self._connected = False
-        logger.info("Realtime STT WebSocket closed")
     
     async def send_event(self, payload: dict):
         """이벤트 전송"""
@@ -142,10 +139,6 @@ class RealtimeSttClient:
         try:
             message = json.dumps(payload)
             event_type = payload.get("type", "unknown")
-            
-            # audio append는 로그 스팸 방지를 위해 조용히 처리
-            if event_type != "input_audio_buffer.append":
-                logger.debug(f"STT: Sending event {event_type}")
             
             await self.ws.send(message)
         except (ConnectionClosedOK, ConnectionClosed, WebSocketException) as e:
@@ -185,13 +178,10 @@ class RealtimeSttClient:
             # base64 인코딩 (raw PCM16 little-endian bytes)
             audio_b64 = base64.b64encode(pcm16_bytes).decode('utf-8')
             
-            # base64 인코딩 검증 (첫 번째 append만 상세 로그)
-            if self._appended_chunks == 0:
-                logger.debug(f"STT append: base64 length={len(audio_b64)}, original bytes={len(pcm16_bytes)}")
-                # base64가 문자열인지 확인
-                if not isinstance(audio_b64, str):
-                    logger.error(f"❌ STT append: base64 encoding failed - not a string")
-                    return False
+            # base64 인코딩 검증
+            if not isinstance(audio_b64, str):
+                logger.error(f"❌ STT append: base64 encoding failed - not a string")
+                return False
             
             payload = {
                 "type": "input_audio_buffer.append",
@@ -209,16 +199,11 @@ class RealtimeSttClient:
             self._pending_appends -= 1  # 전송 완료
             self._buffered_ms = self._appended_chunks * self.chunk_ms
             
-            # 주기적으로 append 상태 로그 (처음 5개 + 이후 100개마다)
-            if self._appended_chunks <= 5 or self._appended_chunks % 100 == 0:
-                logger.info(f"✅ STT append #{self._appended_chunks}: {self._buffered_ms}ms buffered, {self._pending_appends} pending")
-            
             return True
             
         except (ConnectionClosedOK, ConnectionClosed, WebSocketException) as e:
             # WebSocket 종료 시 연결 상태 업데이트하고 조용히 실패 처리
             self._connected = False
-            logger.debug(f"WebSocket closed during append: {e}")
             return False
         except Exception as e:
             logger.error(f"Error appending audio: {e}", exc_info=True)
@@ -237,8 +222,6 @@ class RealtimeSttClient:
             await asyncio.sleep(wait_interval)
             waited += wait_interval
         
-        if self._pending_appends > 0:
-            logger.warning(f"STT flush: {self._pending_appends} pending appends still remaining after {waited:.2f}s")
     
     async def commit(self):
         """
@@ -247,18 +230,15 @@ class RealtimeSttClient:
         로컬 VAD가 말 끝을 감지하면 자동으로 commit 호출
         """
         if not self._connected or not self.ws:
-            logger.warning("STT: Cannot commit - not connected")
             return
         
         # commit 조건 확인: buffered_ms >= 100ms
         if self._buffered_ms < 100:
-            logger.warning(f"STT: Skipping commit - buffer too small ({self._buffered_ms}ms < 100ms minimum)")
             return
         
         # pending_appends 체크: commit 전에 append가 충분히 전송되었는지 확인
         pending_ms = self._pending_appends * self.chunk_ms
         if pending_ms >= 100:
-            logger.warning(f"STT: Skipping commit - too many pending appends ({self._pending_appends} chunks = {pending_ms}ms)")
             return
         
         # append 전송 완료 대기
@@ -269,8 +249,6 @@ class RealtimeSttClient:
                 "type": "input_audio_buffer.commit"
             }
             await self.send_event(payload)
-            
-            logger.info(f"✅ STT commit: {self._buffered_ms}ms ({self._appended_chunks} chunks)")
             
             # commit 후 버퍼 길이 리셋
             self._appended_chunks = 0
@@ -287,7 +265,6 @@ class RealtimeSttClient:
         로컬 VAD가 말 시작을 감지하면 clear 호출
         """
         if not self._connected or not self.ws:
-            logger.warning("STT: Cannot clear - not connected")
             return
         
         try:
@@ -300,8 +277,6 @@ class RealtimeSttClient:
             self._appended_chunks = 0
             self._buffered_ms = 0
             self._pending_appends = 0
-            
-            logger.debug("STT: Buffer cleared")
         except Exception as e:
             logger.error(f"Error clearing buffer: {e}", exc_info=True)
     
@@ -319,7 +294,9 @@ class RealtimeSttClient:
         self,
         on_partial: Optional[Callable[[str], Awaitable[None]]] = None,
         on_final: Optional[Callable[[str], Awaitable[None]]] = None,
-        on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+        on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+        on_speech_started: Optional[Callable[[], Awaitable[None]]] = None,
+        on_speech_stopped: Optional[Callable[[], Awaitable[None]]] = None
     ):
         """
         이벤트 수신 루프 시작
@@ -328,13 +305,16 @@ class RealtimeSttClient:
             on_partial: partial transcript 콜백
             on_final: final transcript 콜백
             on_error: 에러 콜백
+            on_speech_started: speech_started 이벤트 콜백 (server_vad)
+            on_speech_stopped: speech_stopped 이벤트 콜백 (server_vad)
         """
         self._on_partial = on_partial
         self._on_final = on_final
         self._on_error = on_error
+        self._on_speech_started = on_speech_started
+        self._on_speech_stopped = on_speech_stopped
         
         if self._receiver_task:
-            logger.warning("Receiver loop already running")
             return
         
         self._receiver_task = asyncio.create_task(self._receiver_loop())
@@ -357,7 +337,6 @@ class RealtimeSttClient:
                         await self._on_error(e)
         
         except ConnectionClosed:
-            logger.warning("Realtime STT WebSocket connection closed")
             self._connected = False
         except Exception as e:
             logger.error(f"Receiver loop error: {e}", exc_info=True)
@@ -380,12 +359,7 @@ class RealtimeSttClient:
         elif event_type == "transcription.completed":
             transcript = event.get("transcript", "")
             if transcript and self._on_final:
-                logger.info(f"✅ STT final: {transcript}")
                 await self._on_final(transcript)
-            elif transcript:
-                logger.warning(f"STT final received but no callback: {transcript}")
-            else:
-                logger.debug(f"STT completed event but no transcript found: {json.dumps(event, indent=2)[:300]}")
         
         # 3. conversation.item.input_audio_transcription.delta (대화형 transcription)
         elif event_type == "conversation.item.input_audio_transcription.delta":
@@ -397,46 +371,43 @@ class RealtimeSttClient:
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
             if transcript and self._on_final:
-                logger.info(f"✅ STT final: {transcript}")
                 await self._on_final(transcript)
-            elif transcript:
-                logger.warning(f"STT final received but no callback: {transcript}")
-            else:
-                logger.debug(f"STT completed event but no transcript found: {json.dumps(event, indent=2)[:300]}")
         
-        # 5. input_audio_buffer.committed 이벤트 (서버 VAD 모드에서 자동 commit 확인)
+        # 5. input_audio_buffer.cleared 이벤트 (clear() 요청에 대한 ACK)
+        elif event_type == "input_audio_buffer.cleared":
+            pass
+        
+        # 6. input_audio_buffer.committed 이벤트 (commit() 요청에 대한 ACK)
         elif event_type == "input_audio_buffer.committed":
-            # 서버가 자동으로 commit한 경우 (서버 VAD 모드)
-            committed_info = event.get("committed", {})
-            committed_ms = committed_info.get("duration_ms", 0) if committed_info else 0
-            logger.info(f"✅ STT server committed: {committed_ms}ms (server VAD auto-commit)")
+            pass
         
-        # 6. session.created / transcription_session.created 이벤트 (서버 스키마 확인용)
+        # 6-1. input_audio_buffer.speech_started 이벤트 (server_vad)
+        elif event_type == "input_audio_buffer.speech_started":
+            if self._on_speech_started:
+                await self._on_speech_started()
+        
+        # 6-2. input_audio_buffer.speech_stopped 이벤트 (server_vad)
+        elif event_type == "input_audio_buffer.speech_stopped":
+            if self._on_speech_stopped:
+                await self._on_speech_stopped()
+        
+        # 7. conversation.item.created 이벤트 (정상: input_audio 아이템 생성, transcript는 이후 이벤트로 옴)
+        elif event_type == "conversation.item.created":
+            return
+        
+        # 8. session.created / transcription_session.created 이벤트
         elif event_type in ("transcription_session.created", "session.created"):
-            # 서버가 보내는 첫 이벤트에서 정확한 스키마 확인
-            logger.info(f"🧾 Session created - Server schema payload:")
-            logger.info(f"{json.dumps(event, indent=2)[:1200]}")
-            session_data = event.get("session", {})
-            if session_data:
-                logger.info(f"   Session keys: {list(session_data.keys())}")
+            pass
         
-        # 7. transcription_session.updated 이벤트 (세션 설정 확인)
+        # 9. transcription_session.updated 이벤트
         elif event_type == "transcription_session.updated":
-            session_data = event.get("session", {})
-            transcription_config = session_data.get("input_audio_transcription") if session_data else None
-            
-            if transcription_config is None:
-                logger.error("❌ CRITICAL: transcription_session.updated but input_audio_transcription is NULL!")
-                logger.error(f"   Full session data: {json.dumps(session_data, indent=2)[:800]}")
-            else:
-                logger.info(f"✅ Transcription config confirmed: model={transcription_config.get('model')}, language={transcription_config.get('language')}")
-                logger.debug(f"   Full session update: {json.dumps(event, indent=2)[:800]}")
+            pass
         
-        # 7b. session.updated 이벤트 (일반 세션 업데이트)
+        # 10. session.updated 이벤트
         elif event_type == "session.updated":
-            logger.debug(f"Session updated: {event.get('session_id', 'unknown')}")
+            pass
         
-        # 8. error 이벤트 (상세 로깅)
+        # 11. error 이벤트 (상세 로깅)
         elif event_type == "error":
             error_obj = event.get("error", {})
             error_msg = error_obj.get("message", "Unknown error")
@@ -447,13 +418,6 @@ class RealtimeSttClient:
             if self._on_error:
                 await self._on_error(Exception(f"{error_type}: {error_msg}"))
         
-        # 9. 기타 이벤트는 모두 덤프 (서버가 보내는 실제 이벤트 타입 확인용)
+        # 12. 기타 이벤트는 무시
         else:
-            # 모든 미처리 이벤트를 상세 로깅 (서버 스키마 확인)
-            logger.info(f"📩 UNHANDLED EVENT: type={event_type}, keys={list(event.keys())}")
-            logger.info(f"   Full event payload:\n{json.dumps(event, indent=2)[:800]}")
-            
-            # transcription/transcript 관련 키워드가 있으면 더 강조
-            event_str = json.dumps(event, indent=2).lower()
-            if any(keyword in event_str for keyword in ["transcription", "transcript", "delta", "completed"]):
-                logger.warning(f"⚠️ This might be a transcription event we're missing! type={event_type}")
+            pass
