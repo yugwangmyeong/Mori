@@ -11,132 +11,178 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, Me
 from aiortc.contrib.media import MediaPlayer, MediaRelay
 from aiortc.sdp import candidate_from_sdp
 import json
+import wave
+import os
+import time
+from datetime import datetime
 
-from audio_processor import AudioProcessor
-# TODO: 다음 단계에서 활성화
-# from vad_processor import VADProcessor
-# from stt_service import STTService
-# from llm_service import LLMService
-# from tts_service import TTSService
+from audio_encoder import AudioEncoder, encode_audio_frame_for_vad
+from realtime_stt_client import RealtimeSttClient
+from vad_segmenter import VADSegmenter
+import webrtcvad
 
 logger = logging.getLogger(__name__)
 
 
+# AudioChunkBuffer는 AudioEncoder 클래스로 대체됨
+
+
 class AudioTrackReceiver(MediaStreamTrack):
-    """WebRTC에서 받은 오디오 트랙을 처리하는 클래스 (VAD 기반 상태머신)"""
+    """WebRTC에서 받은 오디오 트랙을 처리하는 클래스 (로컬 VAD 모드: VAD로 말 끝 감지 후 commit)"""
     kind = "audio"
     
-    # 상태머신 상태
-    STATE_IDLE = "IDLE"  # 말 안 함
-    STATE_IN_SPEECH = "IN_SPEECH"  # 말 중
-    
-    def __init__(self, track, audio_processor: AudioProcessor, on_speech_end=None):
+    def __init__(self, track, stt_client: Optional[RealtimeSttClient], mic_enabled_callback: Optional[Callable[[], bool]] = None, digital_gain_db: float = 6.0):
         super().__init__()
         self.track = track
-        self.audio_processor = audio_processor
-        self.on_speech_end = on_speech_end  # 말 끝 콜백 (audio_bytes: bytes) -> None
+        self.stt_client = stt_client  # STT 클라이언트
+        self.mic_enabled_callback = mic_enabled_callback  # 마이크 상태 확인 콜백
         
-        # VAD 프레임 정규화 파라미터
-        self.VAD_SR = 16000  # VAD 샘플레이트 (webrtcvad는 16kHz만 지원)
-        self.VAD_FRAME_MS = 20  # VAD 프레임 길이 (10/20/30ms만 지원)
-        self.VAD_BYTES = int(self.VAD_SR * (self.VAD_FRAME_MS / 1000.0) * 2)  # 640 bytes (16kHz * 20ms * 2 bytes/sample)
-        self._vad_buf = bytearray()  # VAD 프레임 버퍼 (20ms 단위로 쪼개기 위해)
+        # 오디오 인코더 (버퍼 기반, 24kHz, 20ms 청크)
+        # digital_gain_db: 입력 음량 증가 (peak 3000~15000 범위로 조정)
+        self.audio_encoder = AudioEncoder(digital_gain_db=digital_gain_db)
         
-        # 상태머신 상태
-        self._vad_state = self.STATE_IDLE
-        self._speech_buf = bytearray()  # speech 구간 오디오 버퍼 (PCM16 bytes)
+        # VAD (Voice Activity Detection) - 16kHz용
+        self.vad = webrtcvad.Vad(2)  # 모드 2 (0-3, 2가 적당)
         
-        # VAD 윈도우 (최근 400ms, 20프레임 * 20ms = 400ms)
-        self._vad_window = deque(maxlen=20)  # 각 프레임의 speech 여부 (1=speech, 0=silence)
+        # VADSegmenter (말 끝 감지 후 commit)
+        self.vad_segmenter: Optional[VADSegmenter] = None
+        if stt_client:
+            self.vad_segmenter = VADSegmenter(
+                on_clear=lambda: stt_client.clear(),
+                on_append=lambda chunk: stt_client.append_audio(chunk),
+                on_commit=lambda: stt_client.commit(),
+                on_get_buffered_ms=lambda: stt_client.get_stats().get('buffered_ms', 0),
+                hangover_ms=500,
+                min_commit_ms=100
+            )
+        
+        # 통계 추적 (5초마다 로그)
+        self._stats = {
+            'peak_sum': 0,
+            'rms_sum': 0.0,
+            'zero_ratio_sum': 0.0,
+            'clipped_ratio_sum': 0.0,
+            'chunk_count': 0,
+            'last_log_time': time.time()
+        }
+        
+        # WebRTC 프레임 정보 추적 (첫 프레임만 상세 로그)
+        self._first_frame_logged = False
+        self._append_count = 0  # append 호출 카운터
         
     async def recv(self):
-        """오디오 프레임 수신 - VAD 기반 상태머신 (20ms 프레임 정규화)"""
+        """오디오 프레임 수신 - 서버 VAD 모드: append만 연속 전송"""
         frame = await self.track.recv()
         
-        # 검증 로그 (일시적, 디버깅용)
-        try:
-            x = frame.to_ndarray()
-            logger.debug(f"[FRAME] dtype={x.dtype}, shape={x.shape}, sr={frame.sample_rate}")
-        except:
-            pass
-        
-        # VAD 판단용 PCM16 변환 (가볍게, 항상 640 bytes 반환)
-        pcm16_bytes = self.audio_processor.to_pcm16_16k_mono(frame)
-        
-        if pcm16_bytes is None:
-            # 변환 실패 시 프레임만 반환 (처리 없음)
+        # STT 클라이언트가 없으면 프레임만 반환
+        if not self.stt_client:
             return frame
         
-        # VAD 프레임 버퍼에 추가
-        self._vad_buf.extend(pcm16_bytes)
+        # 마이크가 꺼져 있으면 STT 처리 건너뛰기
+        if self.mic_enabled_callback and not self.mic_enabled_callback():
+            return frame
         
-        # 20ms 프레임(640 bytes) 단위로 쪼개서 VAD 처리
-        while len(self._vad_buf) >= self.VAD_BYTES:
-            # 20ms 프레임 추출
-            vad_frame = bytes(self._vad_buf[:self.VAD_BYTES])
-            del self._vad_buf[:self.VAD_BYTES]
-            
-            # VAD 디버그 로그 (검증용 - 일시적)
-            logger.debug(f"[VAD FRAME] sr={self.VAD_SR}, bytes={len(vad_frame)}, samples={len(vad_frame)//2}")
-            
-            # VAD로 speech 여부 판단 (반드시 16000 샘플레이트 전달, 640 bytes)
+        # WebRTC 프레임 정보 로깅 (첫 프레임만 상세)
+        if not self._first_frame_logged:
+            upstream_info = {}
             try:
-                is_speech = self.audio_processor.vad.is_speech(vad_frame, self.VAD_SR)
+                audio = frame.to_ndarray()
+                upstream_info = {
+                    'sample_rate': frame.sample_rate,
+                    'format': str(frame.format) if hasattr(frame, 'format') else 'unknown',
+                    'samples': frame.samples if hasattr(frame, 'samples') else 0,
+                    'dtype': str(audio.dtype),
+                    'shape': audio.shape
+                }
+            except:
+                pass
+            logger.info(f"🎤 First WebRTC frame: sr={upstream_info.get('sample_rate')}Hz, "
+                      f"shape={upstream_info.get('shape')}, dtype={upstream_info.get('dtype')}")
+            self._first_frame_logged = True
+        
+        # STT용 24kHz 변환 및 20ms 청크 생성 (버퍼 기반)
+        stt_chunks, stt_metadata = self.audio_encoder.process_frame(frame)
+        
+        if not stt_chunks:
+            return frame
+        
+        # 오디오 에너지가 매우 낮으면 마이크가 꺼진 것으로 간주
+        rms = stt_metadata.get('rms', 0.0)
+        peak = stt_metadata.get('peak', 0)
+        if rms < 0.001 and peak < 100:  # 매우 낮은 에너지
+            return frame
+        
+        # 통계 업데이트
+        self._update_stats(stt_metadata)
+        
+        # VAD용 16kHz 오디오 생성 (VAD 판단용)
+        vad_bytes, vad_metadata = encode_audio_frame_for_vad(frame)
+        is_speech = False
+        if vad_bytes and len(vad_bytes) == 640:  # 16kHz, 20ms = 640 bytes
+            try:
+                is_speech = self.vad.is_speech(vad_bytes, 16000)
             except Exception as e:
-                logger.error(f"VAD error: {e}", exc_info=True)
-                # 에러 발생 시 이 프레임은 스킵하고 다음 프레임 처리
-                break
-            
-            # VAD 윈도우에 추가 (1=speech, 0=silence)
-            self._vad_window.append(1 if is_speech else 0)
-            
-            # 상태머신 처리
-            if len(self._vad_window) < self._vad_window.maxlen:
-                # 윈도우가 채워지지 않았으면 상태 전환하지 않음
-                continue
-            
-            # speech ratio 계산
-            ratio = sum(self._vad_window) / len(self._vad_window)
-            
-            if self._vad_state == self.STATE_IDLE:
-                # IDLE 상태: 말 시작 조건 확인
-                if ratio >= 0.4:  # 40% 이상 speech면 말 시작
-                    self._vad_state = self.STATE_IN_SPEECH
-                    logger.info("🎙️ speech_start")
-                    self._speech_buf.extend(vad_frame)  # 시작 프레임 포함
-                else:
-                    # 무음이면 여기서 끝 - 버퍼/인코딩/로그/STT 없음
+                logger.debug(f"VAD detection error: {e}")
+        
+        # VADSegmenter로 처리 (말 끝 감지 시 자동 commit)
+        if self.vad_segmenter and stt_chunks:
+            for chunk_bytes in stt_chunks:
+                # chunk_bytes 검증 (960 bytes @ 24kHz)
+                if len(chunk_bytes) != 960:
+                    logger.error(f"❌ Invalid chunk size: {len(chunk_bytes)} bytes (expected 960)")
                     continue
                 
-            elif self._vad_state == self.STATE_IN_SPEECH:
-                # IN_SPEECH 상태: 오디오 버퍼에 추가
-                self._speech_buf.extend(vad_frame)
-                
-                # 말 끝 조건: 400ms 동안 거의 무음 (10% 이하)
-                if ratio <= 0.1:
-                    logger.info("🛑 speech_end")
-                    
-                    # speech 구간 오디오 확정
-                    audio_for_stt = bytes(self._speech_buf)
-                    self._speech_buf.clear()
-                    self._vad_state = self.STATE_IDLE
-                    self._vad_window.clear()
-                    
-                    # speech_end에서만 "인코딩 완료 / STT 전송" 로그 출력
-                    logger.info(f"✅ speech segment bytes={len(audio_for_stt)} (16kHz mono PCM16)")
-                    
-                    # TODO: 여기서만 STT 호출 or 큐 enqueue
-                    if self.on_speech_end:
-                        try:
-                            # bytes를 numpy array로 변환하여 콜백에 전달
-                            audio_array = np.frombuffer(audio_for_stt, dtype=np.int16)
-                            await self.on_speech_end(audio_array)
-                        except Exception as e:
-                            logger.error(f"Error in on_speech_end callback: {e}", exc_info=True)
+                # VADSegmenter에 전달 (말 끝 감지 시 commit 호출)
+                await self.vad_segmenter.process_chunk(chunk_bytes, is_speech, stt_metadata)
         
         return frame
     
-
+    def _update_stats(self, metadata: dict):
+        """통계 업데이트 (5초마다 로그 - 로봇톤/정확도 체크리스트)"""
+        if not metadata:
+            return
+        
+        self._stats['peak_sum'] += metadata.get('peak', 0)
+        self._stats['rms_sum'] += metadata.get('rms', 0.0)
+        self._stats['zero_ratio_sum'] += metadata.get('zero_ratio', 0.0)
+        self._stats['clipped_ratio_sum'] += metadata.get('clipped_ratio', 0.0)
+        self._stats['chunk_count'] += 1
+        
+        # 5초마다 요약 로그 (로봇톤/정확도 체크리스트)
+        current_time = time.time()
+        if current_time - self._stats['last_log_time'] >= 5.0:
+            if self._stats['chunk_count'] > 0:
+                avg_peak = self._stats['peak_sum'] / self._stats['chunk_count']
+                avg_rms = self._stats['rms_sum'] / self._stats['chunk_count']
+                avg_zero_ratio = self._stats['zero_ratio_sum'] / self._stats['chunk_count']
+                avg_clipped_ratio = self._stats['clipped_ratio_sum'] / self._stats['chunk_count']
+                
+                # 로봇톤/정확도 체크리스트 로그
+                upstream_info = metadata.get('upstream_info', {})
+                upstream_shape = upstream_info.get('shape', 'unknown')
+                resampled_samples = metadata.get('resampled_samples', 0)
+                
+                logger.info(f"📊 Audio stats (5s): peak={avg_peak:.0f} (recommended: 3000~15000), "
+                          f"rms={avg_rms:.4f}, zero_ratio={avg_zero_ratio:.2%}, "
+                          f"clipped_ratio={avg_clipped_ratio:.2%}")
+                logger.debug(f"   Upstream: shape={upstream_shape}, resampled_samples={resampled_samples}")
+                
+                # peak 권장 범위 체크
+                if avg_peak < 3000:
+                    logger.warning(f"⚠️ Low input level: peak={avg_peak:.0f} < 3000 (recommended: 3000~15000) → STT accuracy may drop")
+                elif avg_peak > 15000:
+                    logger.warning(f"⚠️ High input level: peak={avg_peak:.0f} > 15000 (may cause clipping)")
+            
+            # 통계 리셋
+            self._stats = {
+                'peak_sum': 0,
+                'rms_sum': 0.0,
+                'zero_ratio_sum': 0.0,
+                'clipped_ratio_sum': 0.0,
+                'chunk_count': 0,
+                'last_log_time': current_time
+            }
+    
 
 class AudioTrackSender(MediaStreamTrack):
     """TTS 오디오를 WebRTC로 송출하는 클래스"""
@@ -169,22 +215,28 @@ class AudioTrackSender(MediaStreamTrack):
 class WebRTCHandler:
     """WebRTC 연결 및 오디오 처리 핸들러"""
     
-    def __init__(self, session_id: str, websocket: Optional[WebSocket] = None):
+    def __init__(self, session_id: str, websocket: Optional[WebSocket] = None, enable_stt: bool = True):
         self.session_id = session_id
         self.websocket = websocket  # WebSocket은 선택적 (DataChannel 사용 시 None)
+        self.enable_stt = enable_stt  # STT 활성화 여부
         self.pc: Optional[RTCPeerConnection] = None
         self.data_channel: Optional[RTCDataChannel] = None  # DataChannel
         
-        # 오디오 처리 컴포넌트
-        self.audio_processor = AudioProcessor()
-        # TODO: 다음 단계에서 활성화
-        # self.vad_processor = VADProcessor(
-        #     on_speech_end=self._on_speech_end,
-        #     on_speech_start=self._on_speech_start
-        # )
-        # self.stt_service = STTService()
-        # self.llm_service = LLMService()
-        # self.tts_service = TTSService()
+        # STT 클라이언트 (Realtime Transcription)
+        self.stt_client: Optional[RealtimeSttClient] = None
+        self.receiver_task: Optional[asyncio.Task] = None
+        
+        # 서버 VAD 모드: VADSegmenter 사용 안 함
+        
+        # WAV 덤프 (디버깅용)
+        self.debug_dump_wav = True  # 개발용 플래그
+        self.stt_dump_seq = 0  # WAV 덤프 시퀀스 번호
+        self.stt_accum_pcm16 = bytearray()  # WAV 덤프용 누적 버퍼
+        
+        # 카운터 검증
+        self.queued_chunks = 0  # 큐에 넣은 청크 수
+        self.sent_chunks = 0  # 실제로 전송한 청크 수
+        self.appended_chunks = 0  # append한 청크 수
         
         # 오디오 송출 트랙
         self.audio_sender: Optional[AudioTrackSender] = None
@@ -192,6 +244,7 @@ class WebRTCHandler:
         # 상태 관리
         self.is_speaking = False  # AI가 말하고 있는지
         self.current_turn_cancelled = False  # Barge-in 플래그
+        self.mic_enabled = True  # 마이크 활성화 상태 (기본값: True)
         
     async def handle_connection(self):
         """WebRTC 연결 처리"""
@@ -225,14 +278,17 @@ class WebRTCHandler:
         async def on_track(track):
             if track.kind == "audio":
                 logger.info("Audio track received")
-                # VAD 기반 상태머신으로 오디오 수신
-                receiver = AudioTrackReceiver(
-                    track, 
-                    self.audio_processor, 
-                    on_speech_end=self._on_speech_end
-                )
-                # 트랙을 유지하기 위해 루프 실행
-                asyncio.create_task(self._audio_receive_loop(receiver))
+                # STT 클라이언트가 있으면 AudioTrackReceiver 생성 (서버 VAD 모드)
+                if self.stt_client:
+                    receiver = AudioTrackReceiver(
+                        track, 
+                        self.stt_client,
+                        mic_enabled_callback=lambda: self.mic_enabled,
+                        digital_gain_db=6.0  # 입력 게인 6dB (peak 3000~15000 범위로 조정)
+                    )
+                    asyncio.create_task(self._audio_receive_loop(receiver))
+                else:
+                    logger.warning("STT client not initialized, audio processing skipped")
         
         # WebSocket이 있는 경우에만 시그널링 메시지 처리 (이전 방식)
         if self.websocket:
@@ -257,7 +313,7 @@ class WebRTCHandler:
                 import time
                 current_time = time.time()
                 if current_time - last_log_time >= 1.0:
-                    logger.info(f"📊 오디오 프레임 수신 중... (총 {frame_count}개 프레임 수신됨)")
+            
                     last_log_time = current_time
                 
                 # recv() 내부에서 이미 처리됨
@@ -325,25 +381,39 @@ class WebRTCHandler:
         # DataChannel 이벤트 핸들러 설정
         self._setup_datachannel_handlers()
         
-        # 오디오 트랙 수신 처리
-        @self.pc.on("track")
-        async def on_track(track):
-            if track.kind == "audio":
-                logger.info("✅ Audio track received from client")
-                # VAD 기반 상태머신으로 오디오 수신
-                receiver = AudioTrackReceiver(
-                    track, 
-                    self.audio_processor, 
-                    on_speech_end=self._on_speech_end
-                )
-                asyncio.create_task(self._audio_receive_loop(receiver))
-        
         # 연결 상태 변경
         @self.pc.on("connectionstatechange")
         async def on_connectionstatechange():
             logger.info(f"Connection state: {self.pc.connectionState}")
             if self.pc.connectionState == "failed":
                 await self.cleanup()
+        
+        # STT 파이프라인 먼저 초기화 (오디오 트랙 핸들러 등록 전에)
+        if self.enable_stt:
+            try:
+                await self._setup_stt_pipeline()
+            except Exception as e:
+                logger.error(f"Failed to setup STT during handle_offer: {e}", exc_info=True)
+                # STT 실패해도 WebRTC 연결은 계속 진행
+        else:
+            logger.info("STT is disabled for this session - WebRTC call only")
+        
+        # 오디오 트랙 수신 처리 (STT 파이프라인 초기화 후)
+        @self.pc.on("track")
+        async def on_track(track):
+            if track.kind == "audio":
+                logger.info("✅ Audio track received from client")
+                # STT 클라이언트가 있으면 AudioTrackReceiver 생성 (서버 VAD 모드)
+                if self.stt_client:
+                    receiver = AudioTrackReceiver(
+                        track, 
+                        self.stt_client,
+                        mic_enabled_callback=lambda: self.mic_enabled,
+                        digital_gain_db=6.0  # 입력 게인 6dB (peak 3000~15000 범위로 조정)
+                    )
+                    asyncio.create_task(self._audio_receive_loop(receiver))
+                else:
+                    logger.warning("STT client not initialized, audio processing skipped")
         
         # offer 설정
         offer = RTCSessionDescription(sdp=sdp_offer, type="offer")
@@ -354,6 +424,7 @@ class WebRTCHandler:
         await self.pc.setLocalDescription(answer)
         
         logger.info("✅ WebRTC answer 생성 완료")
+        
         return self.pc.localDescription.sdp
     
     async def _wait_for_connection(self):
@@ -381,7 +452,8 @@ class WebRTCHandler:
                     if isinstance(message, str):
                         data = json.loads(message)
                         logger.debug(f"DataChannel message received: {data}")
-                        # 필요시 메시지 처리 (예: ICE candidates 등)
+                        # 마이크 상태 메시지 처리
+                        asyncio.create_task(self._handle_datachannel_message(data))
                 except Exception as e:
                     logger.error(f"Error processing DataChannel message: {e}")
             
@@ -393,16 +465,34 @@ class WebRTCHandler:
             def on_close():
                 logger.info("DataChannel closed")
     
+    async def _handle_datachannel_message(self, data: dict):
+        """DataChannel 메시지 처리"""
+        msg_type = data.get("type")
+        
+        if msg_type == "mic.enabled" or msg_type == "mic.on":
+            self.mic_enabled = True
+            logger.info("🎤 Microphone enabled")
+        elif msg_type == "mic.disabled" or msg_type == "mic.off":
+            self.mic_enabled = False
+            logger.info("🔇 Microphone disabled")
+            # 마이크가 꺼지면 STT 클라이언트 버퍼 정리 (server_vad 모드에서는 clear 사용 안 함)
+            # server_vad 모드에서는 서버가 자동으로 처리하므로 별도 작업 불필요
+        elif msg_type == "mic.toggle":
+            self.mic_enabled = not self.mic_enabled
+            logger.info(f"🎤 Microphone toggled: {'ON' if self.mic_enabled else 'OFF'}")
+        # 기타 메시지는 무시
+    
     async def _send_datachannel_message(self, message: dict):
         """DataChannel로 메시지 전송"""
         if self.data_channel and self.data_channel.readyState == "open":
             try:
                 message_str = json.dumps(message)
                 self.data_channel.send(message_str)
+                logger.debug(f"📤 DataChannel sent: {message.get('type', 'unknown')}")
             except Exception as e:
-                logger.error(f"Error sending DataChannel message: {e}")
+                logger.error(f"❌ Error sending DataChannel message: {e}", exc_info=True)
         else:
-            logger.warning("DataChannel is not open, cannot send message")
+            logger.warning(f"⚠️ DataChannel is not open (state: {self.data_channel.readyState if self.data_channel else 'None'}), cannot send message: {message.get('type', 'unknown')}")
     
     async def _handle_signaling(self, message: dict):
         """WebRTC 시그널링 메시지 처리 (WebSocket 방식용)"""
@@ -431,136 +521,153 @@ class WebRTCHandler:
             # ICE candidate 처리
             await self._handle_ice_candidate(message)
     
-    async def _on_speech_end(self, audio_buffer: np.ndarray):
-        """사용자가 말을 끝냄 (VAD 무음 400ms 감지) - 말 끝에서만 STT 호출"""
-        logger.info(f"🎤 Speech ended, audio length: {len(audio_buffer)} samples")
+    async def _setup_stt_pipeline(self):
+        """STT 파이프라인 초기화 (로컬 VAD 모드: VAD로 말 끝 감지 후 commit)"""
+        if not self.enable_stt:
+            return
         
-        # TODO: STT 처리 (다음 단계에서 활성화)
-        # try:
-        #     transcript = await self.stt_service.transcribe(audio_buffer)
-        #     if not transcript or transcript.strip() == "":
-        #         logger.warning("Empty transcript")
-        #         return
-        #     
-        #     logger.info(f"STT result: {transcript}")
-        #     
-        #     # 클라이언트에 transcript 전송 (DataChannel)
-        #     await self._send_datachannel_message({
-        #         "type": "transcript",
-        #         "transcript": transcript
-        #     })
-        #     
-        #     # LLM 스트리밍 처리
-        #     await self._process_llm_response(transcript)
-        #     
-        # except Exception as e:
-        #     logger.error(f"Error processing speech: {e}", exc_info=True)
+        logger.info(f"[STT Setup] Starting STT pipeline setup for session: {self.session_id} (Local VAD mode)")
+        
+        try:
+            # STT 클라이언트 생성 및 연결
+            self.stt_client = RealtimeSttClient(self.session_id)
+            await self.stt_client.connect()
+            logger.info("✅ [STT Setup] STT client connected (Local VAD mode)")
+            
+            # 로컬 VAD 모드: VADSegmenter가 말 끝을 감지하면 commit 호출
+            
+            # Receiver 워커 시작
+            self.receiver_task = asyncio.create_task(
+                self._stt_receiver_worker()
+            )
+            logger.info("✅ [STT Setup] STT receiver worker started")
+            
+        except Exception as e:
+            logger.error(f"❌ [STT Setup] Failed to setup STT pipeline: {e}", exc_info=True)
+            self.stt_client = None
     
-    # TODO: 다음 단계에서 활성화
-    # async def _process_llm_response(self, user_message: str):
-    #     """LLM 스트리밍 응답 처리"""
-    #     self.is_speaking = True
-    #     text_buffer = ""
-    #     sentence_buffer = ""
-    #     
-    #     try:
-    #         # LLM 스트리밍 요청
-    #         async for token in self.llm_service.stream_response(user_message):
-    #             if self.current_turn_cancelled:
-    #                 break
-    #             
-    #             text_buffer += token
-    #             sentence_buffer += token
-    #             
-    #             # 문장 분할 규칙 확인
-    #             if self._is_sentence_complete(sentence_buffer):
-    #                 # 문장 완성 → TTS로 전달
-    #                 sentence = sentence_buffer.strip()
-    #                 if sentence:
-    #                     await self._send_to_tts(sentence)
-    #                 sentence_buffer = ""
-    #         
-    #         # 남은 텍스트 처리
-    #         if sentence_buffer.strip() and not self.current_turn_cancelled:
-    #             await self._send_to_tts(sentence_buffer.strip())
-    #             
-    #     except Exception as e:
-    #         logger.error(f"LLM processing error: {e}", exc_info=True)
-    #     finally:
-    #         self.is_speaking = False
-    #         # 클라이언트에 idle phase 전송
-    #         await self._send_datachannel_message({
-    #             "type": "phase",
-    #             "phase": "idle"
-    #         })
-    # 
-    # def _is_sentence_complete(self, text: str) -> bool:
-    #     """문장 완성 여부 판단"""
-    #     if len(text) < 20:  # 최소 길이
-    #         return False
-    #     
-    #     # 문장 경계 확인: . ? ! … \n
-    #     sentence_endings = ['.', '?', '!', '…', '\n']
-    #     if any(text.rstrip().endswith(ending) for ending in sentence_endings):
-    #         return True
-    #     
-    #     # 최대 길이 초과 시 강제 분할
-    #     if len(text) > 200:
-    #         # 마지막 공백이나 구두점에서 분할
-    #         for i in range(len(text) - 1, max(0, len(text) - 50), -1):
-    #             if text[i] in [' ', '.', ',', '!', '?']:
-    #                 return True
-    #         return True
-    #     
-    #     return False
-    # 
-    # async def _send_to_tts(self, text: str):
-    #     """TTS로 텍스트 전달 및 스트리밍"""
-    #     try:
-    #         # TTS가 비활성화된 경우 로그만 출력
-    #         if not hasattr(self.tts_service, 'enabled') or not self.tts_service.enabled:
-    #             logger.warning(f"TTS disabled. Would say: {text}")
-    #             return
-    #         
-    #         # ElevenLabs TTS 스트리밍
-    #         async for audio_chunk in self.tts_service.stream_synthesize(text):
-    #             if self.current_turn_cancelled:
-    #                 break
-    #             
-    #             # 오디오를 WebRTC 형식으로 변환 (16kHz → 48kHz 리샘플링)
-    #             webrtc_frame = await self.audio_processor.prepare_output_frame(audio_chunk)
-    #             
-    #             # WebRTC로 송출
-    #             if self.audio_sender:
-    #                 await self.audio_sender.push_audio(webrtc_frame)
-    #                 
-    #     except Exception as e:
-    #         logger.error(f"TTS error: {e}", exc_info=True)
-    # 
-    # async def _cancel_current_turn(self):
-    #     """현재 턴 취소 (Barge-in)"""
-    #     logger.info("Cancelling current turn")
-    #     # LLM/TTS 작업 취소는 플래그로 처리 (실제 취소는 각 서비스에서 처리)
-    #     # 오디오 큐 flush
-    #     if self.audio_sender:
-    #         # 큐 비우기
-    #         while not self.audio_sender._queue.empty():
-    #             try:
-    #                 self.audio_sender._queue.get_nowait()
-    #             except:
-    #                 break
+    # 서버 VAD 모드: clear/commit 콜백 제거 (append만 연속 전송)
+    
+    async def _dump_wav_file(self):
+        """WAV 덤프 저장 (OpenAI로 보내는 최종 24kHz PCM16)"""
+        try:
+            if len(self.stt_accum_pcm16) == 0:
+                return
+            
+            # 디렉토리 생성
+            dump_dir = "stt_dumps"
+            os.makedirs(dump_dir, exist_ok=True)
+            
+            # 파일명 생성
+            self.stt_dump_seq += 1
+            stt_stats = self.stt_client.get_stats() if self.stt_client else {}
+            sample_rate = stt_stats.get('sample_rate', 24000)  # 24kHz 기본
+            duration_ms = self.appended_chunks * 20  # 20ms per chunk
+            filename = f"{dump_dir}/stt_session_{self.session_id}_{self.stt_dump_seq:04d}_{duration_ms}ms_{sample_rate//1000}k.wav"
+            
+            # WAV 파일 저장 (24kHz 기준) - 재생 시 24kHz로 설정해야 정상 음성처럼 들림
+            with wave.open(filename, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # mono
+                wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                wav_file.setframerate(sample_rate)  # 24kHz (중요: 재생 시 같은 rate로 설정)
+                wav_file.writeframes(bytes(self.stt_accum_pcm16))
+            
+            if os.path.exists(filename):
+                file_size = os.path.getsize(filename)
+                logger.debug(f"WAV dumped: {filename} ({duration_ms}ms, {file_size} bytes, {sample_rate}Hz)")
+        
+        except Exception as e:
+            logger.error(f"STT: Error dumping WAV: {e}", exc_info=True)
+    
+    async def _stt_receiver_worker(self):
+        """STT 결과 수신 워커 (partial/final 전사 결과 처리)"""
+        if not self.stt_client:
+            return
+        
+        # STT 통계 모니터링 태스크 시작 (10초마다 확인)
+        async def monitor_stt_stats():
+            while True:
+                await asyncio.sleep(10.0)
+                if self.stt_client:
+                    stats = self.stt_client.get_stats()
+                    appended_chunks = stats.get('appended_chunks', 0)
+                    buffered_ms = stats.get('buffered_ms', 0)
+                    if appended_chunks == 0:
+                        logger.warning(f"⚠️ STT stats check: appended_chunks=0 (no audio sent to STT!)")
+                    else:
+                        logger.info(f"📊 STT stats: {appended_chunks} chunks appended, {buffered_ms}ms buffered")
+        
+        monitor_task = asyncio.create_task(monitor_stt_stats())
+        
+        try:
+            await self.stt_client.start_receiver_loop(
+                on_partial=self._on_stt_partial,
+                on_final=self._on_stt_final,
+                on_error=self._on_stt_error
+            )
+        except asyncio.CancelledError:
+            logger.debug("STT receiver worker cancelled")
+            monitor_task.cancel()
+        except Exception as e:
+            logger.error(f"STT receiver worker error: {e}", exc_info=True)
+            monitor_task.cancel()
+    
+    async def _on_stt_partial(self, text: str):
+        """STT partial 결과 처리"""
+        if not text or not text.strip():
+            return
+        
+        text_clean = text.strip()
+        logger.info(f"📝 STT partial: {text_clean}")
+        
+        await self._send_datachannel_message({
+            "type": "stt.partial",
+            "text": text_clean
+        })
+    
+    async def _on_stt_final(self, text: str):
+        """STT final 결과 처리"""
+        if not text or not text.strip():
+            return
+        
+        text_clean = text.strip()
+        logger.info(f"✅ STT final: {text_clean}")
+        
+        await self._send_datachannel_message({
+            "type": "stt.final",
+            "text": text_clean
+        })
+    
+    async def _on_stt_error(self, error: Exception):
+        """STT 에러 처리"""
+        logger.error(f"STT error: {error}", exc_info=True)
+        await self._send_datachannel_message({
+            "type": "stt.error",
+            "message": str(error)
+        })
     
     async def cleanup(self):
         """리소스 정리"""
         logger.info(f"Cleaning up session: {self.session_id}")
         
-        try:
-            # TODO: 다음 단계에서 활성화
-            # VAD 정리
-            # await self.vad_processor.cleanup()
-            pass
-        except Exception as e:
-            logger.warning(f"Error cleaning up VAD processor: {e}")
+        # 서버 VAD 모드: VADSegmenter 사용 안 함
+        
+        # STT 워커 정리
+        if self.receiver_task:
+            self.receiver_task.cancel()
+            try:
+                await self.receiver_task
+            except asyncio.CancelledError:
+                pass
+            self.receiver_task = None
+        
+        # STT 클라이언트 종료
+        if self.stt_client:
+            try:
+                await self.stt_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing STT client: {e}")
+            self.stt_client = None
         
         # WebRTC 연결 종료
         if self.pc:
@@ -581,4 +688,3 @@ class WebRTCHandler:
                 logger.warning(f"Error closing audio sender: {e}")
             finally:
                 self.audio_sender = None
-

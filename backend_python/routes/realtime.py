@@ -24,6 +24,11 @@ async def create_call(request: Request):
     """
     WebRTC offer를 받아 answer를 반환
     클라이언트에서 WebRTC offer SDP를 POST로 보내면, answer SDP를 반환
+    
+    Query Parameters:
+        - enable_stt: STT 활성화 여부 (기본값: true)
+            - true: Realtime STT 활성화 (기본값)
+            - false: STT 없이 WebRTC call만 연결
     """
     try:
         # SDP offer를 텍스트로 받음
@@ -37,14 +42,27 @@ async def create_call(request: Request):
                 media_type="text/plain"
             )
         
+        # STT 활성화 여부 확인 (쿼리 파라미터 또는 헤더)
+        enable_stt = True  # 기본값: 활성화
+        query_params = dict(request.query_params)
+        if "enable_stt" in query_params:
+            enable_stt_str = query_params["enable_stt"].lower()
+            enable_stt = enable_stt_str in ("true", "1", "yes", "on")
+        
+        # 헤더에서도 확인 (쿼리 파라미터 우선)
+        if "X-Enable-STT" in request.headers:
+            enable_stt_str = request.headers["X-Enable-STT"].lower()
+            enable_stt = enable_stt_str in ("true", "1", "yes", "on")
+        
         # 세션 ID 생성
         session_id = f"session_{uuid.uuid4().hex[:16]}"
         
         logger.info(f"📡 WebRTC offer 수신 - Session: {session_id}")
         logger.info(f"   SDP 길이: {len(sdp_offer_text)} bytes")
+        logger.info(f"   STT 활성화: {enable_stt}")
         
         # WebRTC 핸들러 생성 (WebSocket 없이, DataChannel 사용)
-        handler = WebRTCHandler(session_id, None)
+        handler = WebRTCHandler(session_id, None, enable_stt=enable_stt)
         active_sessions[session_id] = handler
         
         # offer를 처리하고 answer 생성
