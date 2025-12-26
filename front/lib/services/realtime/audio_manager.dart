@@ -315,5 +315,72 @@ extension RealtimeAudioManager on RealtimeService {
       print('❌ 오디오 스트림 중지 오류: $e');
     }
   }
+  
+  // TTS MP3 파일 재생
+  Future<void> playTtsFile(String filePath) async {
+    try {
+      print('🔊 [playTtsFile] Called with: $filePath');
+      
+      // 파일 존재 확인
+      final file = File(filePath);
+      final exists = await file.exists();
+      print('   → File exists: $exists');
+      
+      if (!exists) {
+        print('   ❌ File not found!');
+        return;
+      }
+      
+      final fileSize = await file.length();
+      print('   → File size: $fileSize bytes');
+      
+      // TTS 플레이어가 없으면 생성
+      if (_ttsPlayer == null) {
+        print('   → Creating new AudioPlayer');
+        _ttsPlayer = AudioPlayer();
+      } else {
+        print('   → Using existing AudioPlayer');
+      }
+      
+      // 기존 재생 중지
+      print('   → Stopping previous playback');
+      await _ttsPlayer!.stop();
+      
+      // MP3 파일 재생
+      print('   → Starting playback...');
+      await _ttsPlayer!.play(DeviceFileSource(filePath));
+      
+      print('🔊 TTS 재생 시작 완료: $filePath');
+      
+      // 재생 완료 리스너 (파일 삭제)
+      _ttsPlayer!.onPlayerComplete.listen((_) async {
+        print('✅ TTS 재생 완료');
+        try {
+          final file = File(filePath);
+          if (await file.exists()) {
+            await file.delete();
+            print('🗑️ TTS 파일 삭제: $filePath');
+          }
+        } catch (e) {
+          print('⚠️ TTS 파일 삭제 실패: $e');
+        }
+      });
+    } catch (e, stackTrace) {
+      print('❌ TTS 재생 오류: $e');
+      print('   Stack trace: $stackTrace');
+    }
+  }
+  
+  // TTS 재생 중지
+  Future<void> stopTts() async {
+    try {
+      if (_ttsPlayer != null) {
+        await _ttsPlayer!.stop();
+        print('🛑 TTS 재생 중지');
+      }
+    } catch (e) {
+      print('❌ TTS 중지 오류: $e');
+    }
+  }
 }
 

@@ -2,10 +2,14 @@
 /// HTTP POST로 시그널링하고 DataChannel로 메시지 교환
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:audioplayers/audioplayers.dart';
 import '../models/ui_phase.dart';
 
 class WebRTCVoiceService {
@@ -32,6 +36,10 @@ class WebRTCVoiceService {
       StreamController<bool>.broadcast();
   
   UiPhase _currentPhase = UiPhase.idle;
+  
+  // TTS 관련
+  final Map<int, List<List<int>>> _ttsBuffers = {};
+  AudioPlayer? _ttsPlayer;
   
   // 서버 URL
   static String get _baseUrl {
@@ -229,6 +237,8 @@ class WebRTCVoiceService {
   void _handleDataChannelMessage(Map<String, dynamic> data) {
     final type = data['type'] as String?;
     
+    print('📨 [DataChannel] Received message type: $type');
+    
     if (type == 'transcript') {
       // STT transcript 수신
       final transcript = data['transcript'] as String?;
@@ -255,6 +265,124 @@ class WebRTCVoiceService {
           _updatePhase(phase);
         }
       }
+    }
+    // Python 백엔드 메시지 처리
+    else if (type == 'vad.speech_started') {
+      print('🎤 VAD: Speech started');
+      _updatePhase(UiPhase.listening);
+    } else if (type == 'vad.speech_stopped') {
+      print('🎤 VAD: Speech stopped');
+      _updatePhase(UiPhase.thinking);
+    } else if (type == 'stt.partial') {
+      final text = data['text'] as String?;
+      if (text != null) {
+        print('📝 STT partial: $text');
+      }
+    } else if (type == 'stt.final') {
+      final text = data['text'] as String?;
+      if (text != null && text.isNotEmpty) {
+        print('✅ STT final: $text');
+        _transcriptController.add(text);
+      }
+    } else if (type == 'llm.response') {
+      final text = data['text'] as String?;
+      if (text != null) {
+        print('🤖 LLM response: $text');
+      }
+    } else if (type == 'tts.start') {
+      print('🔊 [TTS] Received tts.start');
+      _handleTtsStart(data);
+    } else if (type == 'tts.chunk') {
+      print('🔊 [TTS] Received tts.chunk');
+      _handleTtsChunk(data);
+    } else if (type == 'tts.end') {
+      print('🔊 [TTS] Received tts.end');
+      _handleTtsEnd(data);
+    }
+  }
+  
+  // TTS 처리 메서드들
+  void _handleTtsStart(Map<String, dynamic> message) {
+    final turnId = message['turn_id'] as int?;
+    final totalBytes = message['total_bytes'] as int?;
+    
+    print('🔊 [TTS START] turn_id=$turnId, total_bytes=$totalBytes');
+    
+    if (turnId != null) {
+      _ttsBuffers[turnId] = [];
+      print('   → Buffer initialized for turn $turnId');
+    }
+  }
+  
+  void _handleTtsChunk(Map<String, dynamic> message) {
+    final turnId = message['turn_id'] as int?;
+    final audioB64 = message['audio_b64'] as String?;
+    
+    if (turnId != null && audioB64 != null) {
+      try {
+        final bytes = base64Decode(audioB64);
+        _ttsBuffers[turnId]?.add(bytes);
+        print('   → Chunk added: ${bytes.length} bytes');
+      } catch (e) {
+        print('   ❌ Base64 decode error: $e');
+      }
+    }
+  }
+  
+  void _handleTtsEnd(Map<String, dynamic> message) async {
+    final turnId = message['turn_id'] as int?;
+    
+    if (turnId != null && _ttsBuffers.containsKey(turnId)) {
+      try {
+        final allChunks = _ttsBuffers[turnId]!;
+        final totalLength = allChunks.fold<int>(0, (sum, chunk) => sum + chunk.length);
+        final mp3Bytes = Uint8List(totalLength);
+        
+        int offset = 0;
+        for (final chunk in allChunks) {
+          mp3Bytes.setRange(offset, offset + chunk.length, chunk);
+          offset += chunk.length;
+        }
+        
+        print('   → MP3 merged: ${mp3Bytes.length} bytes');
+        
+        // 파일 저장 및 재생
+        await _playTtsAudio(mp3Bytes, turnId);
+        
+        _ttsBuffers.remove(turnId);
+      } catch (e) {
+        print('   ❌ TTS end error: $e');
+      }
+    }
+  }
+  
+  Future<void> _playTtsAudio(Uint8List mp3Bytes, int turnId) async {
+    try {
+      final directory = await getTemporaryDirectory();
+      final filePath = '${directory.path}/tts_$turnId.mp3';
+      final file = File(filePath);
+      await file.writeAsBytes(mp3Bytes);
+      
+      print('   → File saved: $filePath');
+      
+      _ttsPlayer ??= AudioPlayer();
+      await _ttsPlayer!.stop();
+      await _ttsPlayer!.play(DeviceFileSource(filePath));
+      
+      print('🔊 TTS 재생 시작!');
+      
+      _ttsPlayer!.onPlayerComplete.listen((_) async {
+        print('✅ TTS 재생 완료');
+        try {
+          if (await file.exists()) {
+            await file.delete();
+          }
+        } catch (e) {
+          print('⚠️ 파일 삭제 실패: $e');
+        }
+      });
+    } catch (e) {
+      print('❌ TTS 재생 오류: $e');
     }
   }
   

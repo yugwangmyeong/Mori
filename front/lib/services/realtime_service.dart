@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:audioplayers/audioplayers.dart';
 import '../models/ui_phase.dart';
 
 part 'realtime/webrtc_connection.dart';
@@ -37,6 +40,12 @@ class RealtimeService {
   RTCIceConnectionState? _iceState; // ICE 연결 상태
   Timer? _statsTimer; // 마이크 stats 폴링 타이머
   int? _lastAudioBytesSent; // 마지막 오디오 bytesSent 값
+  
+  // TTS 버퍼 (turn_id -> chunks)
+  final Map<int, List<List<int>>> _ttsBuffers = {};
+  
+  // TTS 재생용 AudioPlayer
+  AudioPlayer? _ttsPlayer;
   
   final StreamController<String> _connectionStatusController = StreamController<String>.broadcast();
   final StreamController<Map<String, dynamic>> _messageController = StreamController<Map<String, dynamic>>.broadcast();
@@ -298,6 +307,14 @@ class RealtimeService {
     _stopAudioMonitoring();
     _stopMicStatsProbe();
     _speechStopDebounce?.cancel();
+    
+    // TTS 플레이어 정리
+    if (_ttsPlayer != null) {
+      await _ttsPlayer!.stop();
+      await _ttsPlayer!.dispose();
+      _ttsPlayer = null;
+    }
+    
     await disconnect();
     _connectionStatusController.close();
     _messageController.close();

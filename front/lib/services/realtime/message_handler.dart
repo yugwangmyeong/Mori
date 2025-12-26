@@ -123,8 +123,157 @@ extension RealtimeMessageHandler on RealtimeService {
         }
         _updateConversationReady();
         break;
+      
+      // Python 백엔드 메시지 처리
+      case 'vad.speech_started':
+        _logMic('VAD speech_started (Python backend)');
+        _updateUiPhase(UiPhase.listening);
+        break;
+      case 'vad.speech_stopped':
+        _logMic('VAD speech_stopped (Python backend)');
+        _updateUiPhase(UiPhase.thinking);
+        break;
+      case 'stt.partial':
+        final delta = message['delta'] ?? message['text'] ?? '';
+        if (delta.isNotEmpty) {
+          _logMic('STT partial: $delta');
+        }
+        break;
+      case 'stt.final':
+        final text = message['text'] ?? '';
+        if (text.isNotEmpty) {
+          _logMic('STT final: $text');
+          _userTranscriptController.add(text);
+        }
+        break;
+      case 'llm.response':
+        final text = message['text'] ?? '';
+        if (text.isNotEmpty) {
+          _logEvent('LLM response: $text');
+          _aiResponseTextController.add(text);
+        }
+        break;
+      case 'tts.start':
+        print('🔊 [TTS] Received tts.start');
+        _handleTtsStart(message);
+        break;
+      case 'tts.chunk':
+        print('🔊 [TTS] Received tts.chunk');
+        _handleTtsChunk(message);
+        break;
+      case 'tts.end':
+        print('🔊 [TTS] Received tts.end');
+        _handleTtsEnd(message);
+        break;
+      
       default:
         _logNoisy('message: $type');
+    }
+  }
+  
+  // TTS 처리 관련 메서드 (버퍼는 RealtimeService 클래스에 추가 필요)
+  
+  void _handleTtsStart(Map<String, dynamic> message) {
+    final turnId = message['turn_id'] as int?;
+    final totalBytes = message['total_bytes'] as int?;
+    
+    print('🔊 [TTS START] turn_id=$turnId, total_bytes=$totalBytes');
+    
+    if (turnId != null) {
+      _ttsBuffers[turnId] = [];
+      _logEvent('TTS start: turn_id=$turnId, bytes=$totalBytes');
+      print('   → Buffer initialized for turn $turnId');
+    } else {
+      print('   ⚠️ turn_id is null!');
+    }
+  }
+  
+  void _handleTtsChunk(Map<String, dynamic> message) {
+    final turnId = message['turn_id'] as int?;
+    final audioB64 = message['audio_b64'] as String?;
+    
+    print('🔊 [TTS CHUNK] turn_id=$turnId, has_audio=${audioB64 != null}, b64_length=${audioB64?.length}');
+    
+    if (turnId != null && audioB64 != null) {
+      try {
+        final bytes = base64Decode(audioB64);
+        _ttsBuffers[turnId]?.add(bytes);
+        final bufferSize = _ttsBuffers[turnId]?.length ?? 0;
+        print('   → Chunk added: ${bytes.length} bytes, buffer_chunks=$bufferSize');
+        _logNoisy('TTS chunk received: turn_id=$turnId, bytes=${bytes.length}');
+      } catch (e) {
+        print('   ❌ Base64 decode error: $e');
+        _logEvent('TTS chunk decode error', data: {'error': e.toString()});
+      }
+    } else {
+      print('   ⚠️ Missing data: turn_id=$turnId, audio_b64=${audioB64 != null}');
+    }
+  }
+  
+  void _handleTtsEnd(Map<String, dynamic> message) async {
+    final turnId = message['turn_id'] as int?;
+    
+    print('🔊 [TTS END] turn_id=$turnId, has_buffer=${_ttsBuffers.containsKey(turnId)}');
+    
+    if (turnId != null && _ttsBuffers.containsKey(turnId)) {
+      try {
+        // 모든 청크를 하나로 합치기
+        final allChunks = _ttsBuffers[turnId]!;
+        final chunkCount = allChunks.length;
+        final totalLength = allChunks.fold<int>(0, (sum, chunk) => sum + chunk.length);
+        
+        print('   → Merging $chunkCount chunks, total_bytes=$totalLength');
+        
+        final mp3Bytes = Uint8List(totalLength);
+        
+        int offset = 0;
+        for (final chunk in allChunks) {
+          mp3Bytes.setRange(offset, offset + chunk.length, chunk);
+          offset += chunk.length;
+        }
+        
+        print('   → MP3 merged successfully: ${mp3Bytes.length} bytes');
+        _logEvent('TTS complete: turn_id=$turnId, total_bytes=${mp3Bytes.length}');
+        
+        // MP3 파일로 저장 및 재생
+        print('   → Calling _playTtsAudio...');
+        await _playTtsAudio(mp3Bytes, turnId);
+        
+        // 버퍼 정리
+        _ttsBuffers.remove(turnId);
+        print('   ✅ TTS buffer cleaned');
+      } catch (e) {
+        print('   ❌ TTS end error: $e');
+        _logEvent('TTS end error', data: {'error': e.toString()});
+      }
+    } else {
+      print('   ⚠️ No buffer found for turn $turnId');
+    }
+  }
+  
+  Future<void> _playTtsAudio(Uint8List mp3Bytes, int turnId) async {
+    try {
+      print('🔊 [_playTtsAudio] Starting, bytes=${mp3Bytes.length}');
+      
+      // 임시 디렉토리에 MP3 파일 저장
+      final directory = await getTemporaryDirectory();
+      final filePath = '${directory.path}/tts_$turnId.mp3';
+      final file = File(filePath);
+      
+      print('   → Saving to: $filePath');
+      await file.writeAsBytes(mp3Bytes);
+      print('   → File saved successfully');
+      
+      _logEvent('TTS saved to: $filePath');
+      
+      // audioplayers로 재생
+      print('   → Calling playTtsFile...');
+      await playTtsFile(filePath);
+      
+      print('🔊 TTS 재생 요청 완료: $filePath');
+    } catch (e) {
+      print('❌ [_playTtsAudio] Error: $e');
+      _logEvent('TTS play error', data: {'error': e.toString()});
     }
   }
 

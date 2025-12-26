@@ -19,8 +19,10 @@ from datetime import datetime
 from audio_encoder import AudioEncoder
 from realtime_stt_client import RealtimeSttClient
 from llm_service import LLMService
+from tts_service_elevenlabs import ElevenLabsTTSService
 from uuid import uuid4
 from typing import Optional, Callable, Awaitable
+import base64
 logger = logging.getLogger(__name__)
 
 
@@ -139,8 +141,9 @@ class WebRTCHandler:
         self.current_turn_cancelled = False  # Barge-in 플래그
         self.mic_enabled = True  # 마이크 활성화 상태 (기본값: True)
         
-        # LLM 서비스
+        # LLM/TTS 서비스
         self.llm_service: Optional[LLMService] = None
+        self.tts_service: Optional[ElevenLabsTTSService] = None
         
         # 턴 상태 머신 (server_vad 기반)
         self.turn_id = 0  # 현재 턴 ID (증가값)
@@ -485,6 +488,13 @@ class WebRTCHandler:
             self.llm_service = LLMService()
             logger.info("✅ [STT Setup] LLM service initialized")
             
+            # TTS 서비스 초기화
+            try:
+                self.tts_service = ElevenLabsTTSService()
+                logger.info("✅ [STT Setup] TTS service initialized")
+            except Exception as e:
+                logger.warning(f"⚠️ [STT Setup] TTS service initialization failed: {e}")
+            
             # STT 클라이언트 생성 및 연결
             self.stt_client = RealtimeSttClient(self.session_id)
             await self.stt_client.connect()
@@ -616,6 +626,9 @@ class WebRTCHandler:
             else:
                 logger.warning(f"⚠️ Failed to send LLM response to DataChannel for turn {turn_id}")
             
+            # TTS 생성 및 전송
+            await self._send_tts_for_turn(turn_id, response_text)
+            
         except Exception as e:
             logger.error(f"❌ LLM call error for turn {turn_id}: {e}", exc_info=True)
             await self.send_json({
@@ -623,6 +636,95 @@ class WebRTCHandler:
                 "turn_id": turn_id,
                 "message": str(e)
             })
+    
+    async def _send_tts_for_turn(self, turn_id: int, text: str):
+        """턴에 대해 TTS 생성 및 chunked 전송"""
+        if not self.tts_service:
+            logger.debug(f"TTS service not available for turn {turn_id}")
+            return
+        
+        if not text or not text.strip():
+            logger.debug(f"TTS: Empty text for turn {turn_id}, skipping")
+            return
+        
+        # 토큰 절약: 텍스트를 10자로 제한
+        text_for_tts = text.strip()[:10]
+        if len(text.strip()) > 10:
+            logger.info(f"✂️ TTS text truncated: {len(text)} -> 10 chars")
+        
+        try:
+            logger.info(f"🔊 TTS_REQ turn_id={turn_id} chars={len(text_for_tts)} text=\"{text_for_tts}\"")
+            
+            # TTS 생성 (MP3) - 10자까지만
+            mp3_bytes = await self.tts_service.synthesize_mp3(text_for_tts)
+            
+            if not mp3_bytes:
+                logger.warning(f"⚠️ TTS_ERR turn_id={turn_id} - No audio generated")
+                return
+            
+            total_bytes = len(mp3_bytes)
+            logger.info(f"🔊 TTS_OK turn_id={turn_id} bytes={total_bytes}")
+            
+            # 백엔드에 MP3 파일 저장 (디버깅용)
+            try:
+                tts_dir = "tts_outputs"
+                os.makedirs(tts_dir, exist_ok=True)
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"tts_turn_{turn_id}_{timestamp}.mp3"
+                filepath = os.path.join(tts_dir, filename)
+                
+                with open(filepath, "wb") as f:
+                    f.write(mp3_bytes)
+                
+                logger.info(f"💾 TTS saved to: {filepath}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to save TTS file: {e}")
+            
+            # Chunked 전송 (32KB chunks)
+            chunk_size = 32768  # 32KB
+            total_chunks = (total_bytes + chunk_size - 1) // chunk_size
+            
+            # tts.start 전송
+            await self.send_json({
+                "type": "tts.start",
+                "format": "mp3",
+                "turn_id": turn_id,
+                "total_bytes": total_bytes,
+                "total_chunks": total_chunks
+            })
+            
+            # tts.chunk 전송 (순차적으로)
+            for seq in range(total_chunks):
+                start_idx = seq * chunk_size
+                end_idx = min(start_idx + chunk_size, total_bytes)
+                chunk_bytes = mp3_bytes[start_idx:end_idx]
+                
+                # Base64 인코딩
+                chunk_b64 = base64.b64encode(chunk_bytes).decode('utf-8')
+                
+                success = await self.send_json({
+                    "type": "tts.chunk",
+                    "turn_id": turn_id,
+                    "seq": seq,
+                    "audio_b64": chunk_b64
+                })
+                
+                if not success:
+                    logger.warning(f"⚠️ TTS chunk {seq}/{total_chunks} send failed for turn {turn_id}")
+                    return
+            
+            # tts.end 전송
+            await self.send_json({
+                "type": "tts.end",
+                "turn_id": turn_id,
+                "total_bytes": total_bytes
+            })
+            
+            logger.info(f"✅ TTS transmission complete: turn_id={turn_id}, chunks={total_chunks}, bytes={total_bytes}")
+            
+        except Exception as e:
+            logger.error(f"❌ TTS_ERR turn_id={turn_id}: {e}", exc_info=True)
     
     async def _dump_wav_file(self):
         """WAV 덤프 저장 (OpenAI로 보내는 최종 24kHz PCM16)"""

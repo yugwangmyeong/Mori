@@ -268,10 +268,15 @@ extension RealtimeWebRTCConnection on RealtimeService {
         final data = jsonDecode(message.text) as Map<String, dynamic>;
         final type = data['type'] as String?;
         
-        // 디버깅: 모든 메시지 타입 로그
+        // 디버깅: 모든 메시지 타입 로그 (TTS 메시지 포함)
         if (type != null) {
+          // TTS 메시지는 항상 로그
+          if (type.startsWith('tts.')) {
+            print('📨 [DataChannel TTS] type: $type');
+            print('   → Full data: ${jsonEncode(data)}');
+          }
           // 중요한 이벤트는 상세 로그
-          if (type.contains('transcription') || 
+          else if (type.contains('transcription') || 
               type.contains('response') || 
               type.contains('conversation') ||
               type.contains('error') ||
@@ -280,7 +285,12 @@ extension RealtimeWebRTCConnection on RealtimeService {
             if (kDebugMode && type.contains('transcription')) {
               print('   → 데이터: ${jsonEncode(data)}');
             }
-          } else {
+          } 
+          // Python 백엔드 메시지 (vad, stt, llm)
+          else if (type.startsWith('vad.') || type.startsWith('stt.') || type.startsWith('llm.')) {
+            print('📨 [DataChannel Python] type: $type');
+          }
+          else {
             // 기타 메시지는 간단히만 로그
             if (kDebugMode) {
               print('📨 [DataChannel 메시지] type: $type');
