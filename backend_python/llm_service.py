@@ -5,7 +5,6 @@ OpenAI GPT API 스트리밍 사용
 import logging
 import os
 from typing import AsyncIterator
-from typing import Optional, Callable, Awaitable
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -44,6 +43,8 @@ class LLMService:
         })
         
         try:
+            logger.info(f"LLM: Preparing request for message length={len(user_message)}")
+            
             # 시스템 프롬프트
             messages = [
                 {
@@ -52,6 +53,8 @@ class LLMService:
                 }
             ]
             messages.extend(self.conversation_history[-10:])  # 최근 10개만 사용
+            
+            logger.debug(f"LLM: Sending request with {len(messages)} messages")
             
             # 스트리밍 요청 (동기식 client를 async로 실행)
             loop = asyncio.get_event_loop()
@@ -67,14 +70,20 @@ class LLMService:
             )
             
             assistant_response = ""
+            chunk_count = 0
             
             # 스트림을 async로 처리
             for chunk in stream:
                 await asyncio.sleep(0)  # 이벤트 루프에 제어권 양보
-                if chunk.choices[0].delta.content:
-                    token = chunk.choices[0].delta.content
-                    assistant_response += token
-                    yield token
+                
+                if chunk.choices and len(chunk.choices) > 0:
+                    if chunk.choices[0].delta.content:
+                        token = chunk.choices[0].delta.content
+                        assistant_response += token
+                        chunk_count += 1
+                        yield token
+            
+            logger.info(f"LLM: Response complete, total_chunks={chunk_count}, response_length={len(assistant_response)}")
             
             # 응답을 히스토리에 추가
             if assistant_response:
@@ -82,6 +91,8 @@ class LLMService:
                     "role": "assistant",
                     "content": assistant_response
                 })
+            else:
+                logger.warning("LLM: Received empty response")
                 
         except Exception as e:
             logger.error(f"LLM error: {e}", exc_info=True)

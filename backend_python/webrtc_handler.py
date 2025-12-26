@@ -19,6 +19,7 @@ from datetime import datetime
 from audio_encoder import AudioEncoder
 from realtime_stt_client import RealtimeSttClient
 from llm_service import LLMService
+from uuid import uuid4
 from typing import Optional, Callable, Awaitable
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ class WebRTCHandler:
         self.turn_text_buffer = ""  # 현재 턴 누적 텍스트
         self.awaiting_final = False  # speech_stopped 이후 final/completed 기다리는 상태
         self.final_timeout_task: Optional[asyncio.Task] = None  # final 타임아웃 태스크
+        self.llm_called_for_turn: dict = {}  # turn_id -> bool (중복 LLM 호출 방지)
         self._turn_lock = asyncio.Lock()  # 턴 상태 접근 락
         
     async def handle_connection(self):
@@ -181,7 +183,7 @@ class WebRTCHandler:
         async def on_track(track):
             if track.kind == "audio":
                 logger.info("Audio track received")
-                # STT 클라이언트가 있으면 AudioTrackReceiver 생성 (server_vad 모드)
+                # STT 클라이언트가 있으면 AudioTrackReceiver 생성 (로컬 VAD 모드)
                 if self.stt_client:
                     receiver = AudioTrackReceiver(
                         track, 
@@ -427,9 +429,9 @@ class WebRTCHandler:
             
             # 성공 로그
             msg_type = payload.get('type', 'unknown')
-            turn_id = payload.get('turn_id')
-            if turn_id is not None:
-                logger.info(f"DC_SEND_OK type={msg_type} turn_id={turn_id} bytes={message_bytes}")
+            segment_id = payload.get('segment_id', '')
+            if segment_id:
+                logger.info(f"DC_SEND_OK type={msg_type} seg={segment_id} bytes={message_bytes}")
             else:
                 logger.info(f"DC_SEND_OK type={msg_type} bytes={message_bytes}")
             
@@ -472,11 +474,11 @@ class WebRTCHandler:
             await self._handle_ice_candidate(message)
     
     async def _setup_stt_pipeline(self):
-        """STT 파이프라인 초기화 (server_vad 모드: Realtime STT가 턴을 판단)"""
+        """STT 파이프라인 초기화 (로컬 VAD 모드: VAD로 말 끝 감지 후 commit)"""
         if not self.enable_stt:
             return
         
-        logger.info(f"[STT Setup] Starting STT pipeline setup for session: {self.session_id} (server_vad mode)")
+        logger.info(f"[STT Setup] Starting STT pipeline setup for session: {self.session_id} (Local VAD mode)")
         
         try:
             # LLM 서비스 초기화
@@ -515,7 +517,10 @@ class WebRTCHandler:
                 self.final_timeout_task.cancel()
                 self.final_timeout_task = None
             
-            logger.info(f"🔊 VAD_START turn_id={self.turn_id}")
+            # 이전 턴의 LLM 호출 플래그는 유지 (로그 추적용)
+            # 새 턴이 시작되면 자동으로 새로운 turn_id가 사용됨
+            
+            logger.info(f"VAD_START turn_id={self.turn_id}")
             
             # 클라이언트로 전송
             await self.send_json({
@@ -529,7 +534,7 @@ class WebRTCHandler:
             self.in_speech = False
             self.awaiting_final = True
             
-            logger.info(f"🔇 VAD_STOP turn_id={self.turn_id} buffer_len={len(self.turn_text_buffer)}")
+            logger.info(f"VAD_STOP turn_id={self.turn_id}")
             
             # 클라이언트로 전송
             await self.send_json({
@@ -546,8 +551,10 @@ class WebRTCHandler:
             await asyncio.sleep(2.0)
             
             async with self._turn_lock:
-                # 이미 final이 왔으면 스킵
-                if not self.awaiting_final:
+                current_turn_id = self.turn_id
+                
+                # 이미 LLM이 호출된 턴이면 스킵 (중복 방지)
+                if self.llm_called_for_turn.get(current_turn_id, False):
                     return
                 
                 # 최종 텍스트 결정
@@ -556,17 +563,19 @@ class WebRTCHandler:
                     final_text = "[inaudible]"
                 
                 text_len = len(final_text)
-                logger.info(f"✅ STT_FINAL turn_id={self.turn_id} text_len={text_len} (timeout) text=\"{final_text}\"")
+                logger.info(f"STT_FINAL turn_id={current_turn_id} text_len={text_len} (timeout) text=\"{final_text}\"")
+                
+                # LLM 호출 플래그 설정 (중복 방지)
+                self.llm_called_for_turn[current_turn_id] = True
                 
                 # 클라이언트로 final 전송
                 await self.send_json({
                     "type": "stt.final",
-                    "turn_id": self.turn_id,
+                    "turn_id": current_turn_id,
                     "text": final_text
                 })
                 
                 self.awaiting_final = False
-                current_turn_id = self.turn_id
             
             # 락 해제 후 LLM 호출
             await self._call_llm_for_turn(current_turn_id, final_text)
@@ -580,28 +589,35 @@ class WebRTCHandler:
     async def _call_llm_for_turn(self, turn_id: int, transcript_text: str):
         """턴에 대해 LLM 호출 및 응답 전송"""
         if not self.llm_service:
-            logger.warning(f"LLM service not available for turn {turn_id}")
+            logger.warning(f"⚠️ LLM service not available for turn {turn_id}")
             return
         
         try:
-            logger.info(f"🤖 LLM_REQ turn_id={turn_id} input_chars={len(transcript_text)} input=\"{transcript_text}\"")
+            logger.info(f"🤖 LLM_REQ turn_id={turn_id} chars={len(transcript_text)} input=\"{transcript_text}\"")
             
             # LLM 호출 (간단한 1회 요청)
             response_text = ""
+            token_count = 0
             async for token in self.llm_service.stream_response(transcript_text):
                 response_text += token
+                token_count += 1
             
-            logger.info(f"🤖 LLM_RESP turn_id={turn_id} output_chars={len(response_text)} output=\"{response_text}\"")
+            logger.info(f"🤖 LLM_RESP turn_id={turn_id} chars={len(response_text)} tokens={token_count} output=\"{response_text}\"")
             
             # DataChannel로 응답 전송
-            await self.send_json({
+            success = await self.send_json({
                 "type": "llm.response",
                 "turn_id": turn_id,
                 "text": response_text
             })
             
+            if success:
+                logger.info(f"✅ LLM response sent to DataChannel for turn {turn_id}")
+            else:
+                logger.warning(f"⚠️ Failed to send LLM response to DataChannel for turn {turn_id}")
+            
         except Exception as e:
-            logger.error(f"LLM call error for turn {turn_id}: {e}", exc_info=True)
+            logger.error(f"❌ LLM call error for turn {turn_id}: {e}", exc_info=True)
             await self.send_json({
                 "type": "llm.error",
                 "turn_id": turn_id,
@@ -649,13 +665,14 @@ class WebRTCHandler:
             while True:
                 await asyncio.sleep(10.0)
                 if self.stt_client:
-                    stats = self.stt_client.get_stats()
-                    appended_chunks = stats.get('appended_chunks', 0)
-                    buffered_ms = stats.get('buffered_ms', 0)
-                    if appended_chunks == 0:
-                        logger.warning(f"⚠️ STT stats check: appended_chunks=0 (no audio sent to STT!)")
-                    else:
-                        logger.info(f"📊 STT stats: {appended_chunks} chunks appended, {buffered_ms}ms buffered")
+                    pass  # STT stats 로그 비활성화
+                    # stats = self.stt_client.get_stats()
+                    # appended_chunks = stats.get('appended_chunks', 0)
+                    # buffered_ms = stats.get('buffered_ms', 0)
+                    # if appended_chunks == 0:
+                    #     logger.warning(f"⚠️ STT stats check: appended_chunks=0 (no audio sent to STT!)")
+                    # else:
+                    #     logger.info(f"📊 STT stats: {appended_chunks} chunks appended, {buffered_ms}ms buffered")
         
         monitor_task = asyncio.create_task(monitor_stt_stats())
         
@@ -686,7 +703,7 @@ class WebRTCHandler:
             if self.in_speech or self.awaiting_final:
                 self.turn_text_buffer += text_clean
                 total_len = len(self.turn_text_buffer)
-                logger.info(f"📝 STT_DELTA turn_id={self.turn_id} delta=\"{text_clean}\" total_len={total_len} total=\"{self.turn_text_buffer}\"")
+                logger.info(f"STT_DELTA turn_id={self.turn_id} +=\"{text_clean}\" len={total_len}")
                 
                 # 프론트엔드로 partial 전송
                 await self.send_json({
@@ -701,9 +718,11 @@ class WebRTCHandler:
         text_clean = text.strip() if text else ""
         
         async with self._turn_lock:
-            # awaiting_final 상태가 아니면 무시 (이미 처리된 턴)
-            if not self.awaiting_final:
-                logger.debug(f"STT final received but not awaiting_final, turn_id={self.turn_id}")
+            current_turn_id = self.turn_id
+            
+            # 이미 LLM이 호출된 턴이면 무시 (중복 방지)
+            if self.llm_called_for_turn.get(current_turn_id, False):
+                logger.debug(f"STT final received but LLM already called for turn_id={current_turn_id}")
                 return
             
             # 타임아웃 태스크 취소
@@ -717,11 +736,12 @@ class WebRTCHandler:
                 final_text = "[inaudible]"
             
             text_len = len(final_text)
-            logger.info(f"✅ STT_FINAL turn_id={self.turn_id} text_len={text_len} text=\"{final_text}\"")
+            logger.info(f"STT_FINAL turn_id={current_turn_id} text_len={text_len} text=\"{final_text}\"")
             
             # awaiting_final 플래그 해제
             self.awaiting_final = False
-            current_turn_id = self.turn_id
+            # LLM 호출 플래그 설정 (중복 방지)
+            self.llm_called_for_turn[current_turn_id] = True
             
             # 프론트엔드로 final 전송
             await self.send_json({
@@ -736,7 +756,7 @@ class WebRTCHandler:
     async def _on_stt_error(self, error: Exception):
         """STT 에러 처리"""
         logger.error(f"STT error: {error}", exc_info=True)
-        await self.send_json({
+        await self._send_datachannel_message({
             "type": "stt.error",
             "message": str(error)
         })
